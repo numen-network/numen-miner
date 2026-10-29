@@ -5,6 +5,7 @@ mod report;
 
 use clap::{Parser, Subcommand};
 use numen_kernel::host::Scanner;
+use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -49,6 +50,21 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         threads: usize,
     },
+    /// Combine a GPU dump's retention with a finite miner benchmark.
+    GpuPower {
+        /// Raw feature dump produced by `numen-miner dump`.
+        #[arg(long)]
+        from: PathBuf,
+        /// JSON report produced by `numen-miner bench --json`.
+        #[arg(long)]
+        benchmark: PathBuf,
+        /// Device name in the benchmark report, such as gpu0.
+        #[arg(long, default_value = "gpu0")]
+        device: String,
+        /// Report which feature dimensions moved.
+        #[arg(long)]
+        attribute: bool,
+    },
 }
 
 fn main() {
@@ -71,7 +87,30 @@ fn main() {
             report::throughput(&thr);
             report::power(&ret, &thr);
         }
+        Command::GpuPower { from, benchmark, device, attribute } => {
+            let retention = attribute::measure_dump(&dump::read(&from), attribute);
+            let text = std::fs::read_to_string(&benchmark).expect("read benchmark report");
+            let benchmark: Benchmark = serde_json::from_str(&text).expect("parse benchmark report");
+            let measured = benchmark
+                .devices
+                .iter()
+                .find(|measured| measured.name == device)
+                .unwrap_or_else(|| panic!("benchmark has no device {device}"));
+            report::retention(&retention);
+            report::gpu_power(&retention, &device, measured.hashrate);
+        }
     }
+}
+
+#[derive(Deserialize)]
+struct Benchmark {
+    devices: Vec<BenchmarkDevice>,
+}
+
+#[derive(Deserialize)]
+struct BenchmarkDevice {
+    name: String,
+    hashrate: f64,
 }
 
 pub struct Throughput {

@@ -64,3 +64,12 @@ pub fn power(r: &Retention, t: &Throughput) {
     println!("  net        {:>10.2}x", kernel / canonical);
     println!();
 }
+
+pub fn gpu_power(r: &Retention, device: &str, raw: f64) {
+    let effective = raw * r.rate();
+    println!("effective GPU hash power ({device})");
+    println!("  raw         {:>10.1} H/s", raw);
+    println!("  retention   {:>9.4}%", r.rate() * 100.0);
+    println!("  effective   {:>10.1} H/s", effective);
+    println!();
+}

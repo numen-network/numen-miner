@@ -21,3 +21,5 @@ clap.workspace = true
 hex.workspace = true
 rayon.workspace = true
 libm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
