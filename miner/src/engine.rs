@@ -86,6 +86,12 @@ impl Meter {
         self.scanned.load(Ordering::Relaxed)
     }
 
+    /// Start a fresh measurement window after setup and autotuning.
+    pub fn reset_scanned(&self, now: Instant) {
+        self.scanned.store(0, Ordering::Relaxed);
+        *self.samples.lock().expect("sample lock") = Samples { ring: [(now, 0); SAMPLES], next: 0 };
+    }
+
     pub fn accepted(&self) -> u64 {
         self.accepted.load(Ordering::Relaxed)
     }
@@ -206,6 +212,12 @@ impl Shared {
         self.meters.lock().expect("meter lock").clone()
     }
 
+    pub fn reset_scanned(&self, now: Instant) {
+        for meter in self.meters() {
+            meter.reset_scanned(now);
+        }
+    }
+
     /// Hashes per second across every device.
     pub fn rate(&self, now: Instant) -> f64 {
         self.meters().iter().map(|meter| meter.rate(now)).sum()
@@ -281,4 +293,20 @@ pub fn random_limb() -> u64 {
     let mut bytes = [0u8; 8];
     getrandom::getrandom(&mut bytes).expect("OS random source");
     u64::from_le_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resetting_a_measurement_clears_scanned_work() {
+        let shared = Shared::new();
+        let meter = shared.meter("gpu0".into(), "01:00.0".into(), Some(480), None);
+        meter.add(2_000);
+
+        shared.reset_scanned(Instant::now());
+
+        assert_eq!(meter.scanned(), 0);
+    }
 }

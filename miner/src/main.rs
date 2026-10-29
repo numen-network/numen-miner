@@ -66,6 +66,7 @@ async fn bench(args: &Bench) {
     shared.set_task([0; 32], U256::MAX, 0);
     let workers = spawn_workers(&args.rig, &shared);
     let started = Instant::now();
+    shared.reset_scanned(started);
 
     tokio::select! {
         _ = report_loop(shared.clone(), args.report_interval, None) => {}
@@ -118,18 +119,19 @@ struct BenchmarkDevice {
 }
 
 fn benchmark_report(shared: &Shared, duration: Duration) -> BenchmarkReport {
-    let now = Instant::now();
+    let seconds = duration.as_secs_f64();
     let devices = shared
         .meters()
         .iter()
         .map(|meter| {
             let reading = meter.reading();
+            let scanned = meter.scanned();
             BenchmarkDevice {
                 name: meter.name.clone(),
                 bus: meter.bus.clone(),
                 batch: meter.batch,
-                hashrate: meter.rate(now),
-                scanned: meter.scanned(),
+                hashrate: if seconds > 0.0 { scanned as f64 / seconds } else { 0.0 },
+                scanned,
                 temp: reading.temp,
                 fan: reading.fan.map(|fan| fan.to_string()),
                 power: reading.power,
