@@ -95,6 +95,11 @@ pub const STREAM_BYTES: usize = WARPS * STREAM * 20;
 /// serial f64 code, which in the scan would keep a block waiting on one thread.
 pub const SERIAL_BLOCK: u32 = 128;
 
+/// Hits retained from one launch. Pool difficulty normally produces far less
+/// than one, but a large batch at a low starting difficulty can contain
+/// several. The original single slot silently discarded all but the first.
+pub const MAX_HITS: usize = 16;
+
 /// Shared bytes the draw kernel takes per thread, its permutation strip.
 pub const DRAW_SHARED: u32 = 256;
 
@@ -457,12 +462,13 @@ mod kernels {
         }
         let nonce = nonce_add(&task.nonce, id as u64);
         unsafe {
-            if simt::reserve(out_count) == 0 {
+            let slot = simt::reserve(out_count) as usize;
+            if slot < MAX_HITS {
                 for (i, limb) in nonce.into_iter().enumerate() {
-                    *out_nonce.add(i) = limb;
+                    *out_nonce.add(4 * slot + i) = limb;
                 }
                 for (i, b) in w.into_iter().enumerate() {
-                    *out_work.add(i) = b;
+                    *out_work.add(32 * slot + i) = b;
                 }
             }
         }

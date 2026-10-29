@@ -7,7 +7,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::Ptx;
 use include_bytes_aligned::include_bytes_aligned;
 use libloading::Library;
-use numen_kernel::coop::{self, Packed, SERIAL_BLOCK, Sums};
+use numen_kernel::coop::{self, MAX_HITS, Packed, SERIAL_BLOCK, Sums};
 use numen_kernel::pipeline::N_FEATURES;
 use numen_kernel::sculpt::Params;
 use nvml_wrapper::Nvml;
@@ -249,22 +249,29 @@ impl Readback {
         unsafe {
             Ok(Readback {
                 count: ctx.alloc_pinned(1)?,
-                nonce: ctx.alloc_pinned(4)?,
-                work: ctx.alloc_pinned(32)?,
+                nonce: ctx.alloc_pinned(4 * MAX_HITS)?,
+                work: ctx.alloc_pinned(32 * MAX_HITS)?,
                 copied: ctx.new_event(Some(sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC))?,
             })
         }
     }
 
-    fn hit(&self) -> Result<Option<Candidate>> {
+    fn hits(&self) -> Result<Vec<Candidate>> {
         self.copied.synchronize()?;
-        if self.count.as_slice()?[0] == 0 {
-            return Ok(None);
+        let found = self.count.as_slice()?[0] as usize;
+        if found > MAX_HITS {
+            log::debug!("GPU hit buffer kept {MAX_HITS} of {found} hits; lower --batch or raise pool difficulty");
         }
-        let mut hit = Candidate { nonce: [0; 4], work: [0; 32] };
-        hit.nonce.copy_from_slice(self.nonce.as_slice()?);
-        hit.work.copy_from_slice(self.work.as_slice()?);
-        Ok(Some(hit))
+        let nonces = self.nonce.as_slice()?;
+        let works = self.work.as_slice()?;
+        Ok((0..found.min(MAX_HITS))
+            .map(|slot| {
+                let mut hit = Candidate { nonce: [0; 4], work: [0; 32] };
+                hit.nonce.copy_from_slice(&nonces[4 * slot..4 * slot + 4]);
+                hit.work.copy_from_slice(&works[32 * slot..32 * slot + 32]);
+                hit
+            })
+            .collect())
     }
 }
 
@@ -318,8 +325,8 @@ impl CudaBackend {
             d_stream: stream
                 .alloc_zeros::<u8>(resident as usize * coop::STREAM_BYTES)
                 .context("allocate sample stream")?,
-            d_out_nonce: stream.alloc_zeros::<u64>(4)?,
-            d_out_work: stream.alloc_zeros::<u8>(32)?,
+            d_out_nonce: stream.alloc_zeros::<u64>(4 * MAX_HITS)?,
+            d_out_work: stream.alloc_zeros::<u8>(32 * MAX_HITS)?,
             d_out_count: stream.alloc_zeros::<u32>(1)?,
             stream,
         })
@@ -345,9 +352,9 @@ impl CudaBackend {
     }
 
     /// Wait for the oldest queued launch and return its hit.
-    fn collect(&mut self) -> Result<Option<Candidate>> {
+    fn collect(&mut self) -> Result<Vec<Candidate>> {
         let slot = self.queued.pop_front().context("no launch in flight")?;
-        self.readback[slot].hit()
+        self.readback[slot].hits()
     }
 
     fn launch(&mut self, job: &Job) -> Result<()> {
@@ -440,9 +447,9 @@ pub fn cuda_worker(shared: Arc<Shared>, meter: Arc<Meter>, mut backend: CudaBack
         }
         if let Some(job) = pending.take() {
             match backend.collect() {
-                Ok(hit) => {
+                Ok(hits) => {
                     meter.add(lanes);
-                    if let Some(hit) = hit {
+                    for hit in hits {
                         shared.found(&meter, &job, hit);
                     }
                 }
@@ -688,7 +695,6 @@ pub struct HipBackend {
     draw: *mut c_void,
     scan: *mut c_void,
     finish: *mut c_void,
-    /// Scanning blocks the device holds at once, the scan kernel's grid.
     resident: u32,
     /// The launch's task. Rust hands a struct argument to an AMD kernel by
     /// pointer, so the task rides in device memory rather than in the launch.
@@ -755,9 +761,9 @@ impl HipBackend {
             d_params: alloc(lanes as usize * size_of::<Params>(), "parameters")?,
             d_sums: alloc(lanes as usize * size_of::<Sums>(), "sums")?,
             d_stream: alloc(resident as usize * coop::STREAM_BYTES, "sample stream")?,
-            d_out_nonce: alloc(32, "hit")?,
-            d_out_work: alloc(32, "hit")?,
-            d_out_count: alloc(4, "hit")?,
+            d_out_nonce: alloc(32 * MAX_HITS, "hit nonces")?,
+            d_out_work: alloc(32 * MAX_HITS, "hit work")?,
+            d_out_count: alloc(size_of::<u32>(), "hit count")?,
             hip,
         })
     }
@@ -768,7 +774,7 @@ impl HipBackend {
         hip.check(unsafe { (hip.set_device)(self.ordinal) }, "hipSetDevice")?;
         let task = coop::Task { pre_hash: job.pre_hash, nonce: job.nonce_start, threshold: job.threshold };
         hip.upload(self.d_task, &[task])?;
-        hip.check(unsafe { (hip.memset)(self.d_out_count, 0, 4) }, "hipMemset")?;
+        hip.check(unsafe { (hip.memset)(self.d_out_count, 0, size_of::<u32>()) }, "hipMemset")?;
 
         let serial = self.lanes.div_ceil(SERIAL_BLOCK);
         hip.launch(
@@ -810,18 +816,29 @@ impl HipBackend {
         hip.check(unsafe { (hip.synchronize)() }, "hipDeviceSynchronize")
     }
 
-    fn search(&self, job: &Job) -> Result<Option<Candidate>> {
+    fn search(&self, job: &Job) -> Result<Vec<Candidate>> {
         self.launch(job)?;
-        let hip = &self.hip;
         let mut count = 0u32;
-        hip.download(std::slice::from_mut(&mut count), self.d_out_count)?;
-        if count == 0 {
-            return Ok(None);
+        self.hip.download(std::slice::from_mut(&mut count), self.d_out_count)?;
+        let found = count as usize;
+        if found > MAX_HITS {
+            log::debug!("GPU hit buffer kept {MAX_HITS} of {found} hits; lower --batch or raise pool difficulty");
         }
-        let mut hit = Candidate { nonce: [0; 4], work: [0; 32] };
-        hip.download(&mut hit.nonce, self.d_out_nonce)?;
-        hip.download(&mut hit.work, self.d_out_work)?;
-        Ok(Some(hit))
+        let kept = found.min(MAX_HITS);
+        let mut nonces = vec![0u64; 4 * kept];
+        let mut works = vec![0u8; 32 * kept];
+        if kept != 0 {
+            self.hip.download(&mut nonces, self.d_out_nonce)?;
+            self.hip.download(&mut works, self.d_out_work)?;
+        }
+        Ok((0..kept)
+            .map(|slot| {
+                let mut hit = Candidate { nonce: [0; 4], work: [0; 32] };
+                hit.nonce.copy_from_slice(&nonces[4 * slot..4 * slot + 4]);
+                hit.work.copy_from_slice(&works[32 * slot..32 * slot + 32]);
+                hit
+            })
+            .collect())
     }
 
     /// Raw features of one launch's nonces from `start`, as
@@ -850,8 +867,8 @@ pub fn hip_worker(shared: Arc<Shared>, meter: Arc<Meter>, backend: HipBackend) {
             std::thread::sleep(Duration::from_millis(100));
             continue;
         };
-        let hit = match backend.search(&job) {
-            Ok(hit) => hit,
+        let hits = match backend.search(&job) {
+            Ok(hits) => hits,
             Err(e) => {
                 log::error!("{}: {e:#}", meter.name);
                 std::thread::sleep(Duration::from_secs(1));
@@ -859,7 +876,7 @@ pub fn hip_worker(shared: Arc<Shared>, meter: Arc<Meter>, backend: HipBackend) {
             }
         };
         meter.add(lanes);
-        if let Some(hit) = hit {
+        for hit in hits {
             shared.found(&meter, &job, hit);
         }
     }
