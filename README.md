@@ -65,6 +65,8 @@ To mine at a pool instead, pick one and follow its setup. No node needed.
 
 The release archives carry each of these as a script named after its pool, `.bat` on Windows and `.sh` on Linux. Set `WALLET` in yours and run it.
 
+With a Stratum pool, the miner automatically opens one connection per device so the pool can tune VarDiff separately. The base `WALLET.RIG_NAME` login becomes `WALLET.RIG_NAME-cpu`, `WALLET.RIG_NAME-gpu0`, `WALLET.RIG_NAME-gpu1`, and so on. Every device still uses the same pool port.
+
 ## GPU support
 
 | Vendor | Cards                           | Needs                                |
@@ -100,6 +102,7 @@ Kepler and Maxwell cards can't be preempted in the middle of a launch. On Window
 | `-o, --url <URL>`            | required                | Node websockets (`ws`, `wss`), DiffPool style endpoints (`http`) or stratum pools (`stratum+tcp`, `stratum+ssl`) in failover order. Repeat the option or separate URLs with commas |
 | `-u, --user <WALLET.WORKER>` | none                    | Stratum login, needed for a stratum pool                                                                                                                                           |
 | `-p, --pass <PASS>`          | `x`                     | Stratum password                                                                                                                                                                   |
+| `--worker-mode <MODE>`       | `auto`                  | Connection layout: automatic per-device Stratum workers, one shared `rig` worker, or forced per-`device` connections                                                              |
 | `--cpu`                      | off                     | Mine on the CPU as well                                                                                                                                                            |
 | `-t, --threads <N>`          | every core              | CPU threads when `--cpu` is on                                                                                                                                                     |
 | `--cpu-affinity <LIST>`      | off                     | Logical CPUs to pin one CPU thread each to, as in `0-7,16`, in place of `--threads`                                                                                                |
@@ -113,6 +116,8 @@ Kepler and Maxwell cards can't be preempted in the middle of a launch. On Window
 | `--api-port <PORT>`          | 4068                    | Port of the `/summary` API on 127.0.0.1                                                                                                                                            |
 
 Several URLs in `--url` fail over in order. The miner mines through the first one that answers, and the list may mix nodes and pools. A connection that drops is opened again, and one that stays down through three retries a second apart hands over to the next URL. An attempt with no answer for ten seconds counts as failed, and every failed attempt logs its reason. While on a backup, the miner tries the first URL again every five minutes. The devices idle while no URL is connected.
+
+`--worker-mode auto` gives the CPU group and every GPU its own upstream whenever the failover list contains a Stratum pool. Each connection then has its own VarDiff state, difficulty, jobs, extranonce and reconnect cycle. One failing device connection does not stop the others. Use `--worker-mode rig` to keep one shared connection, or `--worker-mode device` to force separate connections for every endpoint type.
 
 `--cpu` runs a thread per logical CPU, or `--threads` of them, and leaves it to the OS to place them. `--cpu-affinity 0-7,16` runs one thread on each listed CPU instead and pins it there. CPUs go by the numbers the OS gives them. Windows numbers the two threads of a core side by side, while Linux usually puts them a core count apart, as `lscpu -e` shows, so on a 16 core CPU `0-15` means both threads of eight cores on Windows and one thread on each of the sixteen on Linux. A CPU the OS refuses, such as one past the last, costs a warning and its thread runs unpinned.
 
@@ -194,6 +199,8 @@ curl -s http://127.0.0.1:4068/summary
     {
       "name": "gpu0",
       "bus": "2b:00.0",
+      "worker": "rig-gpu0",
+      "difficulty": "4096",
       "batch": 40320,
       "hashrate": 15298.0,
       "accepted": 12,
@@ -207,7 +214,7 @@ curl -s http://127.0.0.1:4068/summary
 }
 ```
 
-`hashrate` is hashes per second over the last minute, or since startup in the first minute. `batch` is the selected GPU launch size and is `null` for the CPU. `temp` is in degrees Celsius and `power` in watts. `fan` is `{"percent": n}` from NVML and `{"rpm": n}` on AMD. A reading the driver doesn't report is `null`. The CPU shows up as `cpu` with an empty `bus`.
+`hashrate` is hashes per second over the last minute, or since startup in the first minute. `worker` is the pool worker without the wallet and is `null` outside Stratum. `difficulty` is a decimal string because node difficulties may exceed JSON's exact integer range, and is `null` while the device has no active task. `batch` is the selected GPU launch size and is `null` for the CPU. `temp` is in degrees Celsius and `power` in watts. `fan` is `{"percent": n}` from NVML and `{"rpm": n}` on AMD. A reading the driver doesn't report is `null`. The CPU shows up as `cpu` with an empty `bus`.
 
 ## HiveOS
 
@@ -233,7 +240,7 @@ The profile's pool and wallet go unused, since the arguments carry them. The das
 
 A node or pool hands out tasks, each a pre-hash and a difficulty. Each nonce seeds a procedurally generated 3D body, which the miner scans into a spectral signature and hashes into a work value. A work value that clears the difficulty seals a block. A pool sets its difficulty far lower, so its shares measure the work done.
 
-The low 64 bits of the nonce count up from zero for each pre-hash. The next 128 bits are random per process. The top 64 bits are the pool's extranonce, or random per node connection, so rigs sharing a node never scan the same nonces.
+The low 64 bits of the nonce count up from zero for each pre-hash. The next 128 bits are random per device group. The top 64 bits are that device connection's pool extranonce, or random per node connection, so devices and rigs never scan the same nonces.
 
 Consumer GPUs run f64 at 1/16 to 1/64 of their f32 rate, so the kernels compute in f32 and miss the chain's answer on a few percent of nonces. Hits go out unchecked, so the few that miss come back rejected.
 
