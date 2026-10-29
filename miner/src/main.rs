@@ -48,7 +48,7 @@ fn list_devices() {
         return;
     }
     let mut table = Table::new();
-    table.set_header(["Device", "Name", "Bus", "Compute", "SMs/CUs", "Memory", "Default batch"]);
+    table.set_header(["Device", "Name", "Bus", "Compute", "SMs/CUs", "Memory", "Autotune base"]);
     for (number, gpu) in gpus.iter().enumerate() {
         table.add_row(match gpu {
             Gpu::Cuda(device) => device.row(number),

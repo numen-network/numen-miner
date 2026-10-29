@@ -131,8 +131,9 @@ pub struct GpuChoice {
     pub devices: Option<Vec<usize>>,
 
     /// Nonces per launch for each mining GPU in order, comma separated. GPUs
-    /// past the end of the list take the last value. By default a GPU takes
-    /// 480 per SM or CU.
+    /// past the end of the list take the last value. When omitted, benchmark
+    /// several sizes around 480 per SM or CU and keep the fastest one for each
+    /// GPU.
     #[arg(
         long,
         short = 'b',
@@ -148,8 +149,8 @@ impl GpuChoice {
         self.devices.as_ref().is_none_or(|devices| devices.contains(&number))
     }
 
-    /// Nonces per launch for the mining GPU at `position`, or `None` to size
-    /// it by its multiprocessor count.
+    /// Nonces per launch for the mining GPU at `position`, or `None` to
+    /// autotune it.
     pub fn lanes_for(&self, position: usize) -> Option<u32> {
         self.batch.get(position).or(self.batch.last()).copied()
     }

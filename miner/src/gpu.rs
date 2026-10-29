@@ -16,7 +16,7 @@ use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fmt;
 use std::ptr::null_mut;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::engine::{Candidate, Job, Meter, Shared};
 use crate::telemetry::{AmdSensors, Sensor};
@@ -25,6 +25,10 @@ use crate::telemetry::{AmdSensors, Sensor};
 /// per nonce and wait on latency when a launch is small, while a launch at
 /// this size still turns over in about 25 ms on an RTX 5070 Ti.
 const NONCES_PER_UNIT: u32 = 480;
+
+/// Time spent measuring each automatic batch-size candidate. This is long
+/// enough to average many launches without making miner startup tedious.
+const AUTOTUNE_TIME: Duration = Duration::from_millis(600);
 
 const MODERN_PTX: &str = include_str!("../ptx/modern.ptx");
 const LEGACY_PTX: &str = include_str!("../ptx/legacy.ptx");
@@ -88,6 +92,24 @@ pub fn gpus() -> Vec<Gpu> {
 /// units, when `--batch` leaves it out.
 fn default_lanes(units: u32) -> u32 {
     NONCES_PER_UNIT * units
+}
+
+/// Batch sizes worth measuring around the architecture-based starting point.
+/// Keep the largest allocation below a quarter of VRAM so tuning cannot crowd
+/// out the desktop or other miner state. The base is always retained.
+fn autotune_lanes(base: u32, memory: usize, resident: u32) -> Vec<u32> {
+    let mut lanes = [base / 2, base, base.saturating_mul(2), base.saturating_mul(4)]
+        .into_iter()
+        .filter(|&candidate| candidate != 0)
+        .filter(|&candidate| candidate == base || state_bytes(candidate, resident) <= memory / 4)
+        .collect::<Vec<_>>();
+    lanes.sort_unstable();
+    lanes.dedup();
+    lanes
+}
+
+fn megahashes(hashes: u64, elapsed: Duration) -> f64 {
+    hashes as f64 / elapsed.as_secs_f64() / 1_000_000.0
 }
 
 /// PCI location as `bus:device.function`, the way nvidia-smi and lspci print it.
@@ -291,7 +313,7 @@ impl CudaBackend {
             "open CUDA device. GPU mining needs an NVIDIA driver from the 470 \
              series of 2021 on",
         )?;
-        let lanes = lanes.unwrap_or(device.default_lanes());
+        let requested_lanes = lanes;
         let (blob, src) = if major >= 7 { ("modern", MODERN_PTX) } else { ("legacy", LEGACY_PTX) };
         let module = ctx.load_module(Ptx::from_src(src)).context("load PTX")?;
         let stream = ctx.default_stream();
@@ -300,17 +322,15 @@ impl CudaBackend {
         scan.set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100)?;
         let resident = device.sms
             * scan.occupancy_max_active_blocks_per_multiprocessor(coop::THREADS, coop::SHARED as usize, None)?;
-        log::info!(
-            "gpu{number} {device}, {blob} kernel, {lanes} nonces per launch, {resident} resident blocks, \
-             {} registers, {} B spilled, {} state",
-            scan.num_regs()?,
-            scan.get_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?,
-            mib(state_bytes(lanes, resident))
+        let candidates = requested_lanes.map_or_else(
+            || autotune_lanes(device.default_lanes(), device.memory, resident),
+            |lanes| vec![lanes],
         );
+        let allocated_lanes = *candidates.iter().max().context("no CUDA batch-size candidate")?;
 
         let Packed { dirs, tris, patches } = blank();
-        Ok(CudaBackend {
-            lanes,
+        let mut backend = CudaBackend {
+            lanes: allocated_lanes,
             draw: module.load_function("poscan_draw").context("find draw kernel")?,
             finish: module.load_function("poscan_finish").context("find finish kernel")?,
             scan,
@@ -320,8 +340,12 @@ impl CudaBackend {
             d_dirs: stream.clone_htod(&dirs).context("upload blank directions")?,
             d_tris: stream.clone_htod(&tris).context("upload blank faces")?,
             d_patches: stream.clone_htod(&patches).context("upload blank patches")?,
-            d_params: stream.alloc_zeros::<u8>(lanes as usize * size_of::<Params>()).context("allocate parameters")?,
-            d_sums: stream.alloc_zeros::<u8>(lanes as usize * size_of::<Sums>()).context("allocate sums")?,
+            d_params: stream
+                .alloc_zeros::<u8>(allocated_lanes as usize * size_of::<Params>())
+                .context("allocate parameters")?,
+            d_sums: stream
+                .alloc_zeros::<u8>(allocated_lanes as usize * size_of::<Sums>())
+                .context("allocate sums")?,
             d_stream: stream
                 .alloc_zeros::<u8>(resident as usize * coop::STREAM_BYTES)
                 .context("allocate sample stream")?,
@@ -329,7 +353,56 @@ impl CudaBackend {
             d_out_work: stream.alloc_zeros::<u8>(32 * MAX_HITS)?,
             d_out_count: stream.alloc_zeros::<u32>(1)?,
             stream,
-        })
+        };
+        if requested_lanes.is_none() {
+            backend.autotune(number, &candidates)?;
+        }
+        log::info!(
+            "gpu{number} {device}, {blob} kernel, {} nonces per launch, {resident} resident blocks, \
+             {} registers, {} B spilled, {} state allocation",
+            backend.lanes,
+            backend.scan.num_regs()?,
+            backend.scan.get_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?,
+            mib(state_bytes(allocated_lanes, resident))
+        );
+        Ok(backend)
+    }
+
+    fn autotune(&mut self, number: usize, candidates: &[u32]) -> Result<()> {
+        let pre_hash = [0x5a; 32];
+        let job = dump_job(&pre_hash, 0);
+        let mut best = (self.lanes, 0.0);
+        self.lanes = candidates[candidates.len() / 2];
+        let warmup = Instant::now();
+        while warmup.elapsed() < AUTOTUNE_TIME {
+            self.launch(&job)?;
+            self.stream.synchronize()?;
+        }
+        log::info!("gpu{number} autotuning batch size across {candidates:?}");
+        for &lanes in candidates {
+            self.lanes = lanes;
+            self.launch(&job)?;
+            self.stream.synchronize()?;
+
+            let started = Instant::now();
+            let mut hashes = 0u64;
+            loop {
+                self.launch(&job)?;
+                self.stream.synchronize()?;
+                hashes += lanes as u64;
+                if started.elapsed() >= AUTOTUNE_TIME {
+                    break;
+                }
+            }
+            let rate = megahashes(hashes, started.elapsed());
+            log::info!("gpu{number} autotune batch {lanes}: {rate:.3} MH/s");
+            if rate > best.1 {
+                best = (lanes, rate);
+            }
+        }
+        self.lanes = best.0;
+        log::info!("gpu{number} autotune selected batch {} at {:.3} MH/s", best.0, best.1);
+        Ok(())
     }
 
     /// Queue a launch over `job` with its hit's readback behind it. The stream
@@ -721,7 +794,7 @@ impl HipBackend {
         }
         let hip = device.hip.clone();
         hip.check(unsafe { (hip.set_device)(device.ordinal) }, "hipSetDevice")?;
-        let lanes = lanes.unwrap_or(device.default_lanes());
+        let requested_lanes = lanes;
         let scan = hip.function(device.module, c"poscan_scan")?;
         let mut per_unit = 0;
         hip.check(
@@ -737,19 +810,17 @@ impl HipBackend {
         if resident == 0 {
             bail!("{} cannot hold a scanning block", device.name);
         }
-        log::info!(
-            "gpu{number} {device}, {lanes} nonces per launch, {resident} resident blocks, {} registers, \
-             {} B scratch, {} state",
-            hip.function_attribute(scan, FUNC_NUM_REGS)?,
-            hip.function_attribute(scan, FUNC_LOCAL_SIZE_BYTES)?,
-            mib(state_bytes(lanes, resident))
+        let candidates = requested_lanes.map_or_else(
+            || autotune_lanes(device.default_lanes(), device.memory, resident),
+            |lanes| vec![lanes],
         );
+        let allocated_lanes = *candidates.iter().max().context("no HIP batch-size candidate")?;
 
         let Packed { dirs, tris, patches } = blank();
         let alloc = |bytes: usize, what: &str| hip.alloc(bytes).with_context(|| format!("allocate {what}"));
-        Ok(HipBackend {
+        let mut backend = HipBackend {
             ordinal: device.ordinal,
-            lanes,
+            lanes: allocated_lanes,
             draw: hip.function(device.module, c"poscan_draw")?,
             finish: hip.function(device.module, c"poscan_finish")?,
             scan,
@@ -758,14 +829,60 @@ impl HipBackend {
             d_dirs: hip.clone_htod(&dirs).context("upload blank directions")?,
             d_tris: hip.clone_htod(&tris).context("upload blank faces")?,
             d_patches: hip.clone_htod(&patches).context("upload blank patches")?,
-            d_params: alloc(lanes as usize * size_of::<Params>(), "parameters")?,
-            d_sums: alloc(lanes as usize * size_of::<Sums>(), "sums")?,
+            d_params: alloc(allocated_lanes as usize * size_of::<Params>(), "parameters")?,
+            d_sums: alloc(allocated_lanes as usize * size_of::<Sums>(), "sums")?,
             d_stream: alloc(resident as usize * coop::STREAM_BYTES, "sample stream")?,
             d_out_nonce: alloc(32 * MAX_HITS, "hit nonces")?,
             d_out_work: alloc(32 * MAX_HITS, "hit work")?,
             d_out_count: alloc(size_of::<u32>(), "hit count")?,
             hip,
-        })
+        };
+        if requested_lanes.is_none() {
+            backend.autotune(number, &candidates)?;
+        }
+        log::info!(
+            "gpu{number} {device}, {} nonces per launch, {resident} resident blocks, {} registers, \
+             {} B scratch, {} state allocation",
+            backend.lanes,
+            backend.hip.function_attribute(scan, FUNC_NUM_REGS)?,
+            backend.hip.function_attribute(scan, FUNC_LOCAL_SIZE_BYTES)?,
+            mib(state_bytes(allocated_lanes, resident))
+        );
+        Ok(backend)
+    }
+
+    fn autotune(&mut self, number: usize, candidates: &[u32]) -> Result<()> {
+        let pre_hash = [0x5a; 32];
+        let job = dump_job(&pre_hash, 0);
+        let mut best = (self.lanes, 0.0);
+        self.lanes = candidates[candidates.len() / 2];
+        let warmup = Instant::now();
+        while warmup.elapsed() < AUTOTUNE_TIME {
+            self.launch(&job)?;
+        }
+        log::info!("gpu{number} autotuning batch size across {candidates:?}");
+        for &lanes in candidates {
+            self.lanes = lanes;
+            self.launch(&job)?;
+
+            let started = Instant::now();
+            let mut hashes = 0u64;
+            loop {
+                self.launch(&job)?;
+                hashes += lanes as u64;
+                if started.elapsed() >= AUTOTUNE_TIME {
+                    break;
+                }
+            }
+            let rate = megahashes(hashes, started.elapsed());
+            log::info!("gpu{number} autotune batch {lanes}: {rate:.3} MH/s");
+            if rate > best.1 {
+                best = (lanes, rate);
+            }
+        }
+        self.lanes = best.0;
+        log::info!("gpu{number} autotune selected batch {} at {:.3} MH/s", best.0, best.1);
+        Ok(())
     }
 
     /// Run a launch over `job` to completion.
@@ -879,5 +996,21 @@ pub fn hip_worker(shared: Arc<Shared>, meter: Arc<Meter>, backend: HipBackend) {
         for hit in hits {
             shared.found(&meter, &job, hit);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autotune_candidates_span_the_base() {
+        assert_eq!(autotune_lanes(480, usize::MAX, 1), [240, 480, 960, 1920]);
+    }
+
+    #[test]
+    fn autotune_candidates_respect_the_memory_cap() {
+        let memory = 4 * state_bytes(960, 1);
+        assert_eq!(autotune_lanes(480, memory, 1), [240, 480, 960]);
     }
 }
