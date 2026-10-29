@@ -31,10 +31,15 @@ PY="$(command -v python || command -v python3)"
 for gfx in "${TARGETS[@]}"; do
     DIR="target/gfx/$gfx"
     mkdir -p "$DIR"
+    FEATURES=()
+    if [ "$gfx" = gfx1100 ]; then
+        FEATURES=(--features gfx1100-quant-profile)
+    fi
     RUSTFLAGS="-Ctarget-cpu=$gfx -Cllvm-args=-unroll-threshold=2000" \
     CARGO_TARGET_DIR="$DIR" \
     cargo +"$GPU_TOOLCHAIN" rustc \
         -p numen-kernel \
+        "${FEATURES[@]}" \
         --release \
         --target amdgcn-amd-amdhsa \
         -Zbuild-std=core,compiler_builtins \
