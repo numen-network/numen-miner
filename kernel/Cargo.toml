@@ -7,6 +7,11 @@ authors.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# Enabled only while compiling the gfx1100 code object.  The calibration is
+# deliberately not applied to unmeasured GPU architectures.
+gfx1100-quant-profile = []
+
 [dependencies]
 libm.workspace = true
 rand_pcg.workspace = true

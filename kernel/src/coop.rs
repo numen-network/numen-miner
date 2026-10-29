@@ -208,14 +208,50 @@ fn bisect(ids: &mut [usize], dir: &impl Fn(usize) -> [f64; 3]) {
 mod kernels {
     use super::*;
     use crate::intrinsics::{ceilf, fmaf, sqrtf};
+    #[cfg(feature = "gfx1100-quant-profile")]
+    use crate::intrinsics::round;
     use crate::pipeline::{
-        Body, Frame, HIST_STEP, Sum, TARGET_SAMPLES, assemble, centroid, cross, dot, real_sh6, sub,
+        Body, Frame, HIST_STEP, N_FEATURES, Sum, TARGET_SAMPLES, assemble, centroid, cross, dot, real_sh6, sub,
     };
     use crate::simt;
     use crate::split::Split;
-    use crate::work::{derive_seed, hash_buckets, meets, nonce_add, quantize};
+    use crate::work::{derive_seed, hash_buckets, meets, nonce_add};
+    #[cfg(not(feature = "gfx1100-quant-profile"))]
+    use crate::work::quantize;
+    #[cfg(feature = "gfx1100-quant-profile")]
+    use crate::work::{EPS_SCALE, QUANT_STEP};
     use crate::perlin::{self, Lattice, Perm};
     use crate::sculpt::PAIRS;
+
+    // Reciprocal p95 bucket errors measured from an independent canonical
+    // sample on gfx1100.  They rank boundary-adjacent features by how likely
+    // their FP result is to have crossed the canonical quantization boundary.
+    #[cfg(feature = "gfx1100-quant-profile")]
+    const QUANT_ERROR_INV: [f64; N_FEATURES] = [
+        35.365483426437059,
+        45.787044988234051,
+        373.98333335285463,
+        264.77412826969606,
+        239.49511400834299,
+        139.51221058093395,
+        252.47439112506049,
+        177.73801934378423,
+        223.21554367933476,
+        148.01388547537064,
+        190.56946702146868,
+        120.89283873810621,
+        208.36250991545006,
+        160.54507178768378,
+        192.22068295938320,
+        0.0,
+        4883.2662200855202,
+        318.72382205141542,
+        101.94518795774624,
+        92.100623130124646,
+        206.53558885833692,
+        522.55929728290391,
+        0.0,
+    ];
 
     /// The noise lattice of the nonce in shared memory, its permutation
     /// inside the parameters and its gradients in their own table, each read
@@ -505,19 +541,49 @@ mod kernels {
             |j| warps(|w| s.hist[w][j]),
         );
 
-        let w = hash_buckets(&quantize(&f), &task.pre_hash);
-        if !meets(&w, &task.threshold) {
-            return;
-        }
-        let nonce = nonce_add(&task.nonce, id as u64);
-        unsafe {
-            let slot = simt::reserve(out_count) as usize;
-            if slot < MAX_HITS {
-                for (i, limb) in nonce.into_iter().enumerate() {
-                    *out_nonce.add(4 * slot + i) = limb;
+        #[cfg(not(feature = "gfx1100-quant-profile"))]
+        let (mut buckets, dimension, neighbor) = (quantize(&f), N_FEATURES, 0i64);
+        #[cfg(feature = "gfx1100-quant-profile")]
+        let (mut buckets, dimension, neighbor) = {
+            let mut buckets = [0i64; N_FEATURES];
+            let mut dimension = N_FEATURES;
+            let mut neighbor = 0i64;
+            let mut chosen_score = f64::INFINITY;
+            for d in 0..f.len() {
+                let width = QUANT_STEP[d] * EPS_SCALE;
+                let scaled = f[d] / width;
+                let bucket = round(scaled) as i64;
+                buckets[d] = bucket;
+                let delta = scaled - bucket as f64;
+                let distance = if delta < 0.0 { -delta } else { delta };
+                let margin = 0.5 - distance;
+                let score = margin * QUANT_ERROR_INV[d];
+                if d != 15 && d != 16 && d != 22 && margin <= 0.05 && score < chosen_score {
+                    dimension = d;
+                    neighbor = if delta < 0.0 { -1 } else { 1 };
+                    chosen_score = score;
                 }
-                for (i, b) in w.into_iter().enumerate() {
-                    *out_work.add(32 * slot + i) = b;
+            }
+            (buckets, dimension, neighbor)
+        };
+        let nonce = nonce_add(&task.nonce, id as u64);
+        let candidates = if dimension == N_FEATURES { 1 } else { 2 };
+        for candidate in 0..candidates {
+            if candidate == 1 && dimension < N_FEATURES {
+                buckets[dimension] += neighbor;
+            }
+            let w = hash_buckets(&buckets, &task.pre_hash);
+            if meets(&w, &task.threshold) {
+                unsafe {
+                    let slot = simt::reserve(out_count) as usize;
+                    if slot < MAX_HITS {
+                        for (i, limb) in nonce.into_iter().enumerate() {
+                            *out_nonce.add(4 * slot + i) = limb;
+                        }
+                        for (i, b) in w.into_iter().enumerate() {
+                            *out_work.add(32 * slot + i) = b;
+                        }
+                    }
                 }
             }
         }
