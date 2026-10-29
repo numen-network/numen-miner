@@ -13,7 +13,7 @@ pub fn spawn_cpu_workers(threads: Vec<Option<usize>>, shared: &Arc<Shared>) -> V
     if threads.is_empty() {
         return Vec::new();
     }
-    let meter = shared.meter("cpu".into(), String::new(), None);
+    let meter = shared.meter("cpu".into(), String::new(), None, None);
     log::info!("cpu threads {}", threads.len());
     threads
         .into_iter()

@@ -61,11 +61,11 @@ fn gpu_features(number: usize, pre_hash: &[u8; 32], count: u64) -> Result<Featur
     let gpu = gpu::gpus().into_iter().nth(number).with_context(|| format!("no gpu{number}"))?;
     match gpu {
         Gpu::Cuda(device) => {
-            let mut backend = CudaBackend::new(number, &device, None)?;
+            let mut backend = CudaBackend::new(number, &device, None, false)?;
             launches(count, |start| backend.features(pre_hash, start))
         }
         Gpu::Hip(device) => {
-            let backend = HipBackend::new(number, &device, None)?;
+            let backend = HipBackend::new(number, &device, None, false)?;
             launches(count, |start| backend.features(pre_hash, start))
         }
     }

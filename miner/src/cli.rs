@@ -131,9 +131,9 @@ pub struct GpuChoice {
     pub devices: Option<Vec<usize>>,
 
     /// Nonces per launch for each mining GPU in order, comma separated. GPUs
-    /// past the end of the list take the last value. When omitted, benchmark
-    /// several sizes around 480 per SM or CU and keep the fastest one for each
-    /// GPU.
+    /// past the end of the list take the last value. When omitted, load the
+    /// saved per-GPU result or benchmark several sizes around 480 per SM or CU
+    /// and save the stable winner.
     #[arg(
         long,
         short = 'b',
@@ -142,6 +142,16 @@ pub struct GpuChoice {
         value_parser = clap::value_parser!(u32).range(1..)
     )]
     pub batch: Vec<u32>,
+
+    /// Ignore a saved automatic batch and measure this machine again. Has no
+    /// meaning with an explicit `--batch`.
+    #[arg(
+        long,
+        env = "NUMEN_MINER_RETUNE",
+        value_parser = BoolishValueParser::new(),
+        conflicts_with = "batch"
+    )]
+    pub retune: bool,
 }
 
 impl GpuChoice {
@@ -164,14 +174,32 @@ fn cpu_range(s: &str) -> Result<RangeInclusive<usize>, ParseIntError> {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Run the chosen devices on a fixed task and print their speed every
-    /// minute until Ctrl+C. No node needed.
-    Bench(Rig),
+    /// Run a reproducible fixed-task benchmark. No node needed.
+    Bench(Bench),
     /// List every GPU with the number `--devices` takes, then exit.
     Devices,
     /// Write one device's raw features for a run of nonces, for
     /// `numen-harness retention --from` to grade against the chain.
     Dump(Dump),
+}
+
+#[derive(Args)]
+pub struct Bench {
+    #[command(flatten)]
+    pub rig: Rig,
+
+    /// Seconds to measure after device setup and autotuning. Zero runs until
+    /// Ctrl+C.
+    #[arg(long, default_value_t = 60)]
+    pub duration: u64,
+
+    /// Seconds between progress reports.
+    #[arg(long, short = 'i', default_value_t = 10)]
+    pub report_interval: u64,
+
+    /// Also write the final machine-readable report to this JSON file.
+    #[arg(long)]
+    pub json: Option<PathBuf>,
 }
 
 #[derive(Args)]

@@ -18,6 +18,7 @@ rustc-ice-*.txt
 
 # code coverage data
 lcov.info
+benchmark-results/
 
 # AI files
 .agents

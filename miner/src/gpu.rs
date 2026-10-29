@@ -16,8 +16,9 @@ use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fmt;
 use std::ptr::null_mut;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::autotune;
 use crate::engine::{Candidate, Job, Meter, Shared};
 use crate::telemetry::{AmdSensors, Sensor};
 
@@ -25,10 +26,6 @@ use crate::telemetry::{AmdSensors, Sensor};
 /// per nonce and wait on latency when a launch is small, while a launch at
 /// this size still turns over in about 25 ms on an RTX 5070 Ti.
 const NONCES_PER_UNIT: u32 = 480;
-
-/// Time spent measuring each automatic batch-size candidate. This is long
-/// enough to average many launches without making miner startup tedious.
-const AUTOTUNE_TIME: Duration = Duration::from_millis(600);
 
 const MODERN_PTX: &str = include_str!("../ptx/modern.ptx");
 const LEGACY_PTX: &str = include_str!("../ptx/legacy.ptx");
@@ -108,8 +105,10 @@ fn autotune_lanes(base: u32, memory: usize, resident: u32) -> Vec<u32> {
     lanes
 }
 
-fn megahashes(hashes: u64, elapsed: Duration) -> f64 {
-    hashes as f64 / elapsed.as_secs_f64() / 1_000_000.0
+fn cuda_driver_version() -> i32 {
+    let mut version = 0;
+    let _ = unsafe { sys::cuDriverGetVersion(&mut version) };
+    version
 }
 
 /// PCI location as `bus:device.function`, the way nvidia-smi and lspci print it.
@@ -304,7 +303,7 @@ struct TaskArg(coop::Task);
 unsafe impl DeviceRepr for TaskArg {}
 
 impl CudaBackend {
-    pub fn new(number: usize, device: &CudaDevice, lanes: Option<u32>) -> Result<Self> {
+    pub fn new(number: usize, device: &CudaDevice, lanes: Option<u32>, retune: bool) -> Result<Self> {
         let (major, minor) = device.compute;
         if major < 3 {
             bail!("{} is compute {major}.{minor} and CUDA mining needs 3.0 or newer", device.name);
@@ -326,7 +325,22 @@ impl CudaBackend {
             || autotune_lanes(device.default_lanes(), device.memory, resident),
             |lanes| vec![lanes],
         );
-        let allocated_lanes = *candidates.iter().max().context("no CUDA batch-size candidate")?;
+        let bus = device.bus();
+        let architecture = format!("sm_{major}{minor}");
+        let key = autotune::Key::new(autotune::Identity {
+            backend: "cuda",
+            bus: &bus,
+            name: &device.name,
+            architecture: &architecture,
+            units: device.sms,
+            memory: device.memory,
+            runtime: cuda_driver_version(),
+            kernel: autotune::fingerprint(&[src.as_bytes()]),
+        });
+        let cached = (requested_lanes.is_none() && !retune).then(|| autotune::cached(&key, &candidates)).flatten();
+        let allocated_lanes = cached.as_ref().map(|tuning| tuning.lanes).unwrap_or(
+            *candidates.iter().max().context("no CUDA batch-size candidate")?,
+        );
 
         let Packed { dirs, tris, patches } = blank();
         let mut backend = CudaBackend {
@@ -354,8 +368,13 @@ impl CudaBackend {
             d_out_count: stream.alloc_zeros::<u32>(1)?,
             stream,
         };
-        if requested_lanes.is_none() {
-            backend.autotune(number, &candidates)?;
+        if let Some(tuning) = cached {
+            backend.lanes = tuning.lanes;
+        } else if requested_lanes.is_none() {
+            let choice = backend.autotune(number, device.default_lanes(), &candidates)?;
+            if let Err(e) = autotune::save(key, &choice) {
+                log::warn!("gpu{number} could not save autotune result: {e:#}");
+            }
         }
         log::info!(
             "gpu{number} {device}, {blob} kernel, {} nonces per launch, {resident} resident blocks, \
@@ -368,41 +387,21 @@ impl CudaBackend {
         Ok(backend)
     }
 
-    fn autotune(&mut self, number: usize, candidates: &[u32]) -> Result<()> {
+    pub fn lanes(&self) -> u32 {
+        self.lanes
+    }
+
+    fn autotune(&mut self, number: usize, base: u32, candidates: &[u32]) -> Result<autotune::Choice> {
         let pre_hash = [0x5a; 32];
         let job = dump_job(&pre_hash, 0);
-        let mut best = (self.lanes, 0.0);
-        self.lanes = candidates[candidates.len() / 2];
-        let warmup = Instant::now();
-        while warmup.elapsed() < AUTOTUNE_TIME {
-            self.launch(&job)?;
-            self.stream.synchronize()?;
-        }
-        log::info!("gpu{number} autotuning batch size across {candidates:?}");
-        for &lanes in candidates {
+        let choice = autotune::run(number, base, candidates, |lanes| {
             self.lanes = lanes;
             self.launch(&job)?;
             self.stream.synchronize()?;
-
-            let started = Instant::now();
-            let mut hashes = 0u64;
-            loop {
-                self.launch(&job)?;
-                self.stream.synchronize()?;
-                hashes += lanes as u64;
-                if started.elapsed() >= AUTOTUNE_TIME {
-                    break;
-                }
-            }
-            let rate = megahashes(hashes, started.elapsed());
-            log::info!("gpu{number} autotune batch {lanes}: {rate:.3} MH/s");
-            if rate > best.1 {
-                best = (lanes, rate);
-            }
-        }
-        self.lanes = best.0;
-        log::info!("gpu{number} autotune selected batch {} at {:.3} MH/s", best.0, best.1);
-        Ok(())
+            Ok(())
+        })?;
+        self.lanes = choice.lanes;
+        Ok(choice)
     }
 
     /// Queue a launch over `job` with its hit's readback behind it. The stream
@@ -539,6 +538,7 @@ pub fn cuda_worker(shared: Arc<Shared>, meter: Arc<Meter>, mut backend: CudaBack
 /// The HIP runtime, bound at run time.
 struct Hip {
     get_device_count: unsafe extern "C" fn(*mut c_int) -> c_int,
+    runtime_get_version: unsafe extern "C" fn(*mut c_int) -> c_int,
     set_device: unsafe extern "C" fn(c_int) -> c_int,
     device_get_name: unsafe extern "C" fn(*mut c_char, c_int, c_int) -> c_int,
     device_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> c_int,
@@ -563,6 +563,7 @@ impl Hip {
             let library = Library::new(name)?;
             Ok(Hip {
                 get_device_count: *library.get(b"hipGetDeviceCount\0")?,
+                runtime_get_version: *library.get(b"hipRuntimeGetVersion\0")?,
                 set_device: *library.get(b"hipSetDevice\0")?,
                 device_get_name: *library.get(b"hipDeviceGetName\0")?,
                 device_get_attribute: *library.get(b"hipDeviceGetAttribute\0")?,
@@ -595,6 +596,11 @@ impl Hip {
         let mut count = 0;
         self.check(unsafe { (self.get_device_count)(&mut count) }, "hipGetDeviceCount")?;
         Ok(count)
+    }
+
+    fn runtime_version(&self) -> c_int {
+        let mut version = 0;
+        if unsafe { (self.runtime_get_version)(&mut version) } == 0 { version } else { 0 }
     }
 
     fn attribute(&self, attribute: c_int, ordinal: c_int) -> Result<c_int> {
@@ -663,6 +669,7 @@ pub struct HipDevice {
     name: String,
     arch: Option<&'static str>,
     module: *mut c_void,
+    kernel: u64,
     cus: u32,
     memory: usize,
     pci: [i32; 3],
@@ -742,14 +749,15 @@ fn probe_hip(hip: &Arc<Hip>, ordinal: c_int) -> Result<HipDevice> {
     let loaded = CODE_OBJECTS.iter().find_map(|&(arch, image)| {
         let mut module = null_mut();
         let code = unsafe { (hip.module_load_data)(&mut module, image.as_ptr().cast()) };
-        (code == 0).then_some((arch, module))
+        (code == 0).then_some((arch, module, autotune::fingerprint(&[image])))
     });
     Ok(HipDevice {
         hip: hip.clone(),
         ordinal,
         name: unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned(),
-        arch: loaded.map(|(arch, _)| arch),
-        module: loaded.map_or(null_mut(), |(_, module)| module),
+        arch: loaded.map(|(arch, _, _)| arch),
+        module: loaded.map_or(null_mut(), |(_, module, _)| module),
+        kernel: loaded.map_or(0, |(_, _, kernel)| kernel),
         cus: hip.attribute(MULTIPROCESSOR_COUNT, ordinal)? as u32,
         memory,
         pci: [
@@ -788,7 +796,7 @@ pub struct HipBackend {
 unsafe impl Send for HipBackend {}
 
 impl HipBackend {
-    pub fn new(number: usize, device: &HipDevice, lanes: Option<u32>) -> Result<Self> {
+    pub fn new(number: usize, device: &HipDevice, lanes: Option<u32>, retune: bool) -> Result<Self> {
         if device.arch.is_none() {
             bail!("{} has no embedded kernel for its architecture", device.name);
         }
@@ -814,7 +822,21 @@ impl HipBackend {
             || autotune_lanes(device.default_lanes(), device.memory, resident),
             |lanes| vec![lanes],
         );
-        let allocated_lanes = *candidates.iter().max().context("no HIP batch-size candidate")?;
+        let bus = device.bus();
+        let key = autotune::Key::new(autotune::Identity {
+            backend: "hip",
+            bus: &bus,
+            name: &device.name,
+            architecture: device.arch.unwrap_or("unsupported"),
+            units: device.cus,
+            memory: device.memory,
+            runtime: hip.runtime_version(),
+            kernel: device.kernel,
+        });
+        let cached = (requested_lanes.is_none() && !retune).then(|| autotune::cached(&key, &candidates)).flatten();
+        let allocated_lanes = cached.as_ref().map(|tuning| tuning.lanes).unwrap_or(
+            *candidates.iter().max().context("no HIP batch-size candidate")?,
+        );
 
         let Packed { dirs, tris, patches } = blank();
         let alloc = |bytes: usize, what: &str| hip.alloc(bytes).with_context(|| format!("allocate {what}"));
@@ -837,8 +859,13 @@ impl HipBackend {
             d_out_count: alloc(size_of::<u32>(), "hit count")?,
             hip,
         };
-        if requested_lanes.is_none() {
-            backend.autotune(number, &candidates)?;
+        if let Some(tuning) = cached {
+            backend.lanes = tuning.lanes;
+        } else if requested_lanes.is_none() {
+            let choice = backend.autotune(number, device.default_lanes(), &candidates)?;
+            if let Err(e) = autotune::save(key, &choice) {
+                log::warn!("gpu{number} could not save autotune result: {e:#}");
+            }
         }
         log::info!(
             "gpu{number} {device}, {} nonces per launch, {resident} resident blocks, {} registers, \
@@ -851,38 +878,20 @@ impl HipBackend {
         Ok(backend)
     }
 
-    fn autotune(&mut self, number: usize, candidates: &[u32]) -> Result<()> {
+    pub fn lanes(&self) -> u32 {
+        self.lanes
+    }
+
+    fn autotune(&mut self, number: usize, base: u32, candidates: &[u32]) -> Result<autotune::Choice> {
         let pre_hash = [0x5a; 32];
         let job = dump_job(&pre_hash, 0);
-        let mut best = (self.lanes, 0.0);
-        self.lanes = candidates[candidates.len() / 2];
-        let warmup = Instant::now();
-        while warmup.elapsed() < AUTOTUNE_TIME {
-            self.launch(&job)?;
-        }
-        log::info!("gpu{number} autotuning batch size across {candidates:?}");
-        for &lanes in candidates {
+        let choice = autotune::run(number, base, candidates, |lanes| {
             self.lanes = lanes;
             self.launch(&job)?;
-
-            let started = Instant::now();
-            let mut hashes = 0u64;
-            loop {
-                self.launch(&job)?;
-                hashes += lanes as u64;
-                if started.elapsed() >= AUTOTUNE_TIME {
-                    break;
-                }
-            }
-            let rate = megahashes(hashes, started.elapsed());
-            log::info!("gpu{number} autotune batch {lanes}: {rate:.3} MH/s");
-            if rate > best.1 {
-                best = (lanes, rate);
-            }
-        }
-        self.lanes = best.0;
-        log::info!("gpu{number} autotune selected batch {} at {:.3} MH/s", best.0, best.1);
-        Ok(())
+            Ok(())
+        })?;
+        self.lanes = choice.lanes;
+        Ok(choice)
     }
 
     /// Run a launch over `job` to completion.

@@ -30,6 +30,7 @@ struct Summary {
 struct Device {
     name: String,
     bus: String,
+    batch: Option<u32>,
     hashrate: f64,
     accepted: u64,
     rejected: u64,
@@ -72,6 +73,7 @@ async fn summary(State(api): State<Api>) -> Json<Summary> {
             Device {
                 name: meter.name.clone(),
                 bus: meter.bus.clone(),
+                batch: meter.batch,
                 hashrate: meter.rate(now),
                 accepted: meter.accepted(),
                 rejected: meter.rejected(),

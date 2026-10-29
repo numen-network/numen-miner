@@ -1,4 +1,5 @@
 mod api;
+mod autotune;
 mod cli;
 mod cpu;
 mod dump;
@@ -10,11 +11,13 @@ mod telemetry;
 mod upstream;
 
 use clap::Parser;
-use cli::{Command, Cli, GpuChoice, Rig};
+use cli::{Bench, Command, Cli, GpuChoice, Rig, VERSION};
 use comfy_table::Table;
 use engine::Shared;
 use nvml_wrapper::Nvml;
 use primitive_types::U256;
+use serde::Serialize;
+use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use telemetry::{AmdSensors, TempLimit};
@@ -30,7 +33,7 @@ async fn main() {
     let cli = Cli::parse();
     match &cli.command {
         Some(Command::Devices) => list_devices(),
-        Some(Command::Bench(rig)) => bench(rig, cli.report_interval).await,
+        Some(Command::Bench(args)) => bench(args).await,
         Some(Command::Dump(args)) => {
             if let Err(e) = dump::dump(args) {
                 log::error!("{e:#}");
@@ -58,20 +61,97 @@ fn list_devices() {
     println!("{table}");
 }
 
-async fn bench(rig: &Rig, report_interval: u64) {
+async fn bench(args: &Bench) {
     let shared = Arc::new(Shared::new());
     shared.set_task([0; 32], U256::MAX, 0);
-    let workers = spawn_workers(rig, &shared);
+    let workers = spawn_workers(&args.rig, &shared);
+    let started = Instant::now();
 
     tokio::select! {
-        _ = report_loop(shared.clone(), report_interval, None) => {}
+        _ = report_loop(shared.clone(), args.report_interval, None) => {}
         _ = tokio::signal::ctrl_c() => log::info!("shutting down"),
+        _ = benchmark_deadline(args.duration) => log::info!("benchmark duration complete"),
     }
 
     shared.stop();
     for w in workers {
         let _ = w.join();
     }
+    let report = benchmark_report(&shared, started.elapsed());
+    log::info!("final benchmark\n{}", speed_report(&shared));
+    if let Some(path) = &args.json
+        && let Err(e) = write_benchmark(path, &report)
+    {
+        log::error!("write benchmark {}: {e:#}", path.display());
+    }
+}
+
+async fn benchmark_deadline(seconds: u64) {
+    if seconds == 0 {
+        std::future::pending::<()>().await;
+    } else {
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BenchmarkReport {
+    version: &'static str,
+    duration_seconds: f64,
+    hashrate: f64,
+    scanned: u64,
+    devices: Vec<BenchmarkDevice>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BenchmarkDevice {
+    name: String,
+    bus: String,
+    batch: Option<u32>,
+    hashrate: f64,
+    scanned: u64,
+    temp: Option<f64>,
+    fan: Option<String>,
+    power: Option<f64>,
+}
+
+fn benchmark_report(shared: &Shared, duration: Duration) -> BenchmarkReport {
+    let now = Instant::now();
+    let devices = shared
+        .meters()
+        .iter()
+        .map(|meter| {
+            let reading = meter.reading();
+            BenchmarkDevice {
+                name: meter.name.clone(),
+                bus: meter.bus.clone(),
+                batch: meter.batch,
+                hashrate: meter.rate(now),
+                scanned: meter.scanned(),
+                temp: reading.temp,
+                fan: reading.fan.map(|fan| fan.to_string()),
+                power: reading.power,
+            }
+        })
+        .collect::<Vec<_>>();
+    BenchmarkReport {
+        version: VERSION,
+        duration_seconds: duration.as_secs_f64(),
+        hashrate: devices.iter().map(|device| device.hashrate).sum(),
+        scanned: devices.iter().map(|device| device.scanned).sum(),
+        devices,
+    }
+}
+
+fn write_benchmark(path: &Path, report: &BenchmarkReport) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(report)?)?;
+    log::info!("wrote benchmark to {}", path.display());
+    Ok(())
 }
 
 async fn work(cli: &Cli) {
@@ -127,13 +207,18 @@ fn spawn_gpu_workers(choice: &GpuChoice, shared: &Arc<Shared>) -> Vec<JoinHandle
         let lanes = choice.lanes_for(position);
         let shared = shared.clone();
         let worker = match gpu {
-            Gpu::Cuda(device) => gpu::CudaBackend::new(number, &device, lanes).map(|backend| {
+            Gpu::Cuda(device) => gpu::CudaBackend::new(number, &device, lanes, choice.retune).map(|backend| {
                 let sensor = nvml.as_ref().map(|nvml| device.sensor(nvml));
-                let meter = shared.meter(format!("gpu{number}"), device.bus(), sensor);
+                let meter = shared.meter(format!("gpu{number}"), device.bus(), Some(backend.lanes()), sensor);
                 std::thread::spawn(move || cuda_worker(shared, meter, backend))
             }),
-            Gpu::Hip(device) => gpu::HipBackend::new(number, &device, lanes).map(|backend| {
-                let meter = shared.meter(format!("gpu{number}"), device.bus(), device.sensor(&amd_sensors));
+            Gpu::Hip(device) => gpu::HipBackend::new(number, &device, lanes, choice.retune).map(|backend| {
+                let meter = shared.meter(
+                    format!("gpu{number}"),
+                    device.bus(),
+                    Some(backend.lanes()),
+                    device.sensor(&amd_sensors),
+                );
                 std::thread::spawn(move || hip_worker(shared, meter, backend))
             }),
         };

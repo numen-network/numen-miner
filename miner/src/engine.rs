@@ -44,6 +44,7 @@ const SAMPLES: usize = 60;
 pub struct Meter {
     pub name: String,
     pub bus: String,
+    pub batch: Option<u32>,
     scanned: AtomicU64,
     accepted: AtomicU64,
     rejected: AtomicU64,
@@ -61,10 +62,11 @@ struct Samples {
 }
 
 impl Meter {
-    fn new(name: String, bus: String, sensor: Option<Sensor>, now: Instant) -> Self {
+    fn new(name: String, bus: String, batch: Option<u32>, sensor: Option<Sensor>, now: Instant) -> Self {
         Meter {
             name,
             bus,
+            batch,
             scanned: AtomicU64::new(0),
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
@@ -194,8 +196,8 @@ impl Shared {
         })
     }
 
-    pub fn meter(&self, name: String, bus: String, sensor: Option<Sensor>) -> Arc<Meter> {
-        let meter = Arc::new(Meter::new(name, bus, sensor, Instant::now()));
+    pub fn meter(&self, name: String, bus: String, batch: Option<u32>, sensor: Option<Sensor>) -> Arc<Meter> {
+        let meter = Arc::new(Meter::new(name, bus, batch, sensor, Instant::now()));
         self.meters.lock().expect("meter lock").push(meter.clone());
         meter
     }
