@@ -548,9 +548,17 @@ struct Hip {
     func_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, *mut c_void) -> c_int,
     occupancy: unsafe extern "C" fn(*mut c_int, *mut c_void, c_int, usize) -> c_int,
     malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> c_int,
+    host_malloc: unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> c_int,
     memcpy_htod: unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> c_int,
     memcpy_dtoh: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> c_int,
+    memcpy_htod_async: unsafe extern "C" fn(*mut c_void, *const c_void, usize, *mut c_void) -> c_int,
+    memcpy_dtoh_async: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut c_void) -> c_int,
     memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> c_int,
+    memset_async: unsafe extern "C" fn(*mut c_void, c_int, usize, *mut c_void) -> c_int,
+    stream_create: unsafe extern "C" fn(*mut *mut c_void) -> c_int,
+    event_create: unsafe extern "C" fn(*mut *mut c_void) -> c_int,
+    event_record: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int,
+    event_synchronize: unsafe extern "C" fn(*mut c_void) -> c_int,
     launch_kernel: Launch,
     synchronize: unsafe extern "C" fn() -> c_int,
     error_string: unsafe extern "C" fn(c_int) -> *const c_char,
@@ -573,9 +581,17 @@ impl Hip {
                 func_get_attribute: *library.get(b"hipFuncGetAttribute\0")?,
                 occupancy: *library.get(b"hipModuleOccupancyMaxActiveBlocksPerMultiprocessor\0")?,
                 malloc: *library.get(b"hipMalloc\0")?,
+                host_malloc: *library.get(b"hipHostMalloc\0")?,
                 memcpy_htod: *library.get(b"hipMemcpyHtoD\0")?,
                 memcpy_dtoh: *library.get(b"hipMemcpyDtoH\0")?,
+                memcpy_htod_async: *library.get(b"hipMemcpyHtoDAsync\0")?,
+                memcpy_dtoh_async: *library.get(b"hipMemcpyDtoHAsync\0")?,
                 memset: *library.get(b"hipMemset\0")?,
+                memset_async: *library.get(b"hipMemsetAsync\0")?,
+                stream_create: *library.get(b"hipStreamCreate\0")?,
+                event_create: *library.get(b"hipEventCreate\0")?,
+                event_record: *library.get(b"hipEventRecord\0")?,
+                event_synchronize: *library.get(b"hipEventSynchronize\0")?,
                 launch_kernel: *library.get(b"hipModuleLaunchKernel\0")?,
                 synchronize: *library.get(b"hipDeviceSynchronize\0")?,
                 error_string: *library.get(b"hipGetErrorString\0")?,
@@ -630,6 +646,25 @@ impl Hip {
         Ok(ptr)
     }
 
+    fn host_alloc<T>(&self) -> Result<*mut T> {
+        let mut ptr = null_mut();
+        self.check(unsafe { (self.host_malloc)(&mut ptr, size_of::<T>(), 0) }, "hipHostMalloc")?;
+        unsafe { ptr.cast::<u8>().write_bytes(0, size_of::<T>()) };
+        Ok(ptr.cast())
+    }
+
+    fn stream(&self) -> Result<*mut c_void> {
+        let mut stream = null_mut();
+        self.check(unsafe { (self.stream_create)(&mut stream) }, "hipStreamCreate")?;
+        Ok(stream)
+    }
+
+    fn event(&self) -> Result<*mut c_void> {
+        let mut event = null_mut();
+        self.check(unsafe { (self.event_create)(&mut event) }, "hipEventCreate")?;
+        Ok(event)
+    }
+
     fn upload<T: Copy>(&self, dst: *mut c_void, src: &[T]) -> Result<()> {
         let bytes = size_of_val(src);
         self.check(unsafe { (self.memcpy_htod)(dst, src.as_ptr().cast(), bytes) }, "hipMemcpyHtoD")
@@ -646,9 +681,41 @@ impl Hip {
         self.check(unsafe { (self.memcpy_dtoh)(dst.as_mut_ptr().cast(), src, bytes) }, "hipMemcpyDtoH")
     }
 
+    fn upload_async<T: Copy>(&self, dst: *mut c_void, src: *const T, count: usize, stream: *mut c_void) -> Result<()> {
+        self.check(
+            unsafe { (self.memcpy_htod_async)(dst, src.cast(), count * size_of::<T>(), stream) },
+            "hipMemcpyHtoDAsync",
+        )
+    }
+
+    fn download_async<T: Copy>(
+        &self,
+        dst: *mut T,
+        src: *mut c_void,
+        count: usize,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        self.check(
+            unsafe { (self.memcpy_dtoh_async)(dst.cast(), src, count * size_of::<T>(), stream) },
+            "hipMemcpyDtoHAsync",
+        )
+    }
+
     fn launch(&self, func: *mut c_void, grid: u32, block: u32, shared: u32, args: &mut [*mut c_void]) -> Result<()> {
+        self.launch_on(func, grid, block, shared, args, null_mut())
+    }
+
+    fn launch_on(
+        &self,
+        func: *mut c_void,
+        grid: u32,
+        block: u32,
+        shared: u32,
+        args: &mut [*mut c_void],
+        stream: *mut c_void,
+    ) -> Result<()> {
         let code = unsafe {
-            (self.launch_kernel)(func, grid, 1, 1, block, 1, 1, shared, null_mut(), args.as_mut_ptr(), null_mut())
+            (self.launch_kernel)(func, grid, 1, 1, block, 1, 1, shared, stream, args.as_mut_ptr(), null_mut())
         };
         self.check(code, "hipModuleLaunchKernel")
     }
@@ -768,6 +835,25 @@ fn probe_hip(hip: &Arc<Hip>, ordinal: c_int) -> Result<HipDevice> {
     })
 }
 
+#[repr(C)]
+struct HipStaging {
+    task: coop::Task,
+    count: u32,
+    nonces: [u64; 4 * MAX_HITS],
+    works: [u8; 32 * MAX_HITS],
+}
+
+struct HipSlot {
+    staging: *mut HipStaging,
+    event: *mut c_void,
+}
+
+impl HipSlot {
+    fn new(hip: &Hip) -> Result<Self> {
+        Ok(HipSlot { staging: hip.host_alloc()?, event: hip.event()? })
+    }
+}
+
 /// A block per nonce, the kernels `CudaBackend` runs built for AMD.
 pub struct HipBackend {
     hip: Arc<Hip>,
@@ -789,6 +875,9 @@ pub struct HipBackend {
     d_out_nonce: *mut c_void,
     d_out_work: *mut c_void,
     d_out_count: *mut c_void,
+    stream: *mut c_void,
+    slots: [HipSlot; 2],
+    queued: VecDeque<usize>,
 }
 
 // HIP handles and device pointers belong to the process, not to the thread
@@ -857,6 +946,9 @@ impl HipBackend {
             d_out_nonce: alloc(32 * MAX_HITS, "hit nonces")?,
             d_out_work: alloc(32 * MAX_HITS, "hit work")?,
             d_out_count: alloc(size_of::<u32>(), "hit count")?,
+            stream: hip.stream()?,
+            slots: [HipSlot::new(&hip)?, HipSlot::new(&hip)?],
+            queued: VecDeque::with_capacity(2),
             hip,
         };
         if let Some(tuning) = cached {
@@ -892,6 +984,89 @@ impl HipBackend {
         })?;
         self.lanes = choice.lanes;
         Ok(choice)
+    }
+
+    /// Queue a complete launch and pinned readback. Two host slots let the
+    /// next launch sit behind the current one before the worker waits for and
+    /// validates the current result, removing the host round trip between
+    /// batches without allowing two scan kernels to overlap.
+    fn enqueue(&mut self, job: &Job) -> Result<()> {
+        let slot = self.queued.back().map_or(0, |slot| 1 - slot);
+        let staging = unsafe { &mut *self.slots[slot].staging };
+        staging.task = coop::Task { pre_hash: job.pre_hash, nonce: job.nonce_start, threshold: job.threshold };
+
+        let hip = &self.hip;
+        hip.check(unsafe { (hip.set_device)(self.ordinal) }, "hipSetDevice")?;
+        hip.upload_async(self.d_task, &raw const staging.task, 1, self.stream)?;
+        hip.check(
+            unsafe { (hip.memset_async)(self.d_out_count, 0, size_of::<u32>(), self.stream) },
+            "hipMemsetAsync",
+        )?;
+
+        let serial = self.lanes.div_ceil(SERIAL_BLOCK);
+        hip.launch_on(
+            self.draw,
+            serial,
+            SERIAL_BLOCK,
+            coop::DRAW_SHARED * SERIAL_BLOCK,
+            &mut [arg(&self.d_task), arg(&self.lanes), arg(&self.d_params)],
+            self.stream,
+        )?;
+        hip.launch_on(
+            self.scan,
+            self.lanes.min(self.resident),
+            coop::THREADS,
+            coop::SHARED,
+            &mut [
+                arg(&self.d_dirs),
+                arg(&self.d_tris),
+                arg(&self.d_patches),
+                arg(&self.d_params),
+                arg(&self.d_sums),
+                arg(&self.d_stream),
+                arg(&self.lanes),
+            ],
+            self.stream,
+        )?;
+        hip.launch_on(
+            self.finish,
+            serial,
+            SERIAL_BLOCK,
+            0,
+            &mut [
+                arg(&self.d_sums),
+                arg(&self.d_task),
+                arg(&self.lanes),
+                arg(&self.d_out_nonce),
+                arg(&self.d_out_work),
+                arg(&self.d_out_count),
+            ],
+            self.stream,
+        )?;
+        hip.download_async(&raw mut staging.count, self.d_out_count, 1, self.stream)?;
+        hip.download_async(staging.nonces.as_mut_ptr(), self.d_out_nonce, staging.nonces.len(), self.stream)?;
+        hip.download_async(staging.works.as_mut_ptr(), self.d_out_work, staging.works.len(), self.stream)?;
+        hip.check(unsafe { (hip.event_record)(self.slots[slot].event, self.stream) }, "hipEventRecord")?;
+        self.queued.push_back(slot);
+        Ok(())
+    }
+
+    fn collect(&mut self) -> Result<Vec<Candidate>> {
+        let slot = self.queued.pop_front().context("collect HIP launch with no queued work")?;
+        let hip = &self.hip;
+        hip.check(unsafe { (hip.event_synchronize)(self.slots[slot].event) }, "hipEventSynchronize")?;
+        let staging = unsafe { &*self.slots[slot].staging };
+        let found = staging.count as usize;
+        if found > MAX_HITS {
+            log::debug!("GPU hit buffer kept {MAX_HITS} of {found} hits; lower --batch or raise pool difficulty");
+        }
+        let kept = found.min(MAX_HITS);
+        Ok((0..kept)
+            .map(|hit| Candidate {
+                nonce: staging.nonces[4 * hit..4 * hit + 4].try_into().expect("four nonce limbs"),
+                work: staging.works[32 * hit..32 * hit + 32].try_into().expect("32 work bytes"),
+            })
+            .collect())
     }
 
     /// Run a launch over `job` to completion.
@@ -942,31 +1117,6 @@ impl HipBackend {
         hip.check(unsafe { (hip.synchronize)() }, "hipDeviceSynchronize")
     }
 
-    fn search(&self, job: &Job) -> Result<Vec<Candidate>> {
-        self.launch(job)?;
-        let mut count = 0u32;
-        self.hip.download(std::slice::from_mut(&mut count), self.d_out_count)?;
-        let found = count as usize;
-        if found > MAX_HITS {
-            log::debug!("GPU hit buffer kept {MAX_HITS} of {found} hits; lower --batch or raise pool difficulty");
-        }
-        let kept = found.min(MAX_HITS);
-        let mut nonces = vec![0u64; 4 * kept];
-        let mut works = vec![0u8; 32 * kept];
-        if kept != 0 {
-            self.hip.download(&mut nonces, self.d_out_nonce)?;
-            self.hip.download(&mut works, self.d_out_work)?;
-        }
-        Ok((0..kept)
-            .map(|slot| {
-                let mut hit = Candidate { nonce: [0; 4], work: [0; 32] };
-                hit.nonce.copy_from_slice(&nonces[4 * slot..4 * slot + 4]);
-                hit.work.copy_from_slice(&works[32 * slot..32 * slot + 32]);
-                hit
-            })
-            .collect())
-    }
-
     /// Raw features of one launch's nonces from `start`, as
     /// `CudaBackend::features` takes them.
     pub fn features(&self, pre_hash: &[u8; 32], start: u64) -> Result<Vec<Option<[f64; N_FEATURES]>>> {
@@ -982,28 +1132,47 @@ fn arg<T>(value: &T) -> *mut c_void {
     (value as *const T).cast_mut().cast()
 }
 
-pub fn hip_worker(shared: Arc<Shared>, meter: Arc<Meter>, backend: HipBackend) {
+pub fn hip_worker(shared: Arc<Shared>, meter: Arc<Meter>, mut backend: HipBackend) {
     let lanes = backend.lanes as u64;
+    let mut pending: Option<Job> = None;
     while !shared.stopped() {
-        if meter.paused() {
+        let paused = meter.paused();
+        let mut next = if paused { None } else { shared.next_job(lanes) };
+        if let Some(job) = &next
+            && let Err(e) = backend.enqueue(job)
+        {
+            log::error!("{}: {e:#}", meter.name);
+            let _ = backend.hip.check(
+                unsafe { (backend.hip.synchronize)() },
+                "hipDeviceSynchronize(recover enqueue)",
+            );
+            backend.queued.clear();
+            pending = None;
             std::thread::sleep(Duration::from_secs(1));
             continue;
         }
-        let Some(job) = shared.next_job(lanes) else {
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        };
-        let hits = match backend.search(&job) {
-            Ok(hits) => hits,
-            Err(e) => {
-                log::error!("{}: {e:#}", meter.name);
-                std::thread::sleep(Duration::from_secs(1));
-                continue;
+        if let Some(job) = pending.take() {
+            match backend.collect() {
+                Ok(hits) => {
+                    meter.add(lanes);
+                    for hit in hits {
+                        shared.found(&meter, &job, hit);
+                    }
+                }
+                Err(e) => {
+                    log::error!("{}: {e:#}", meter.name);
+                    let _ = backend.hip.check(
+                        unsafe { (backend.hip.synchronize)() },
+                        "hipDeviceSynchronize(recover collect)",
+                    );
+                    backend.queued.clear();
+                    next = None;
+                }
             }
-        };
-        meter.add(lanes);
-        for hit in hits {
-            shared.found(&meter, &job, hit);
+        }
+        pending = next;
+        if pending.is_none() {
+            std::thread::sleep(Duration::from_millis(if paused { 1000 } else { 100 }));
         }
     }
 }
