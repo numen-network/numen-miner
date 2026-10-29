@@ -58,25 +58,28 @@ impl Sums {
     }
 }
 
-/// Shared memory, the sculpted vertices, the block reduction slots, and then
-/// the nonce's parameters while sculpting or each warp's list of split faces
-/// while sampling.
+/// Shared memory: scalar vertex displacements, reduction slots later reused
+/// by the split-face lists, then the nonce parameters and lookup tables.
 const VERTS: u32 = 0;
-const RED: u32 = VERTS + (N_VERTS * 12) as u32;
+const RED: u32 = VERTS + (N_VERTS * 4) as u32;
 const PARAMS: u32 = RED + (WARPS * 11 * 8) as u32;
 #[cfg(any(target_arch = "nvptx64", target_arch = "amdgpu"))]
-const LIST: u32 = PARAMS;
-const LIST_BYTES: usize = WARPS * 32 * 8;
+const LIST: u32 = RED;
+const LIST_BYTES: usize = WARPS * 32;
 
 /// The noise gradient table, 16 rows of 16 bytes.
-const GRADS: u32 = PARAMS + if size_of::<Params>() > LIST_BYTES { size_of::<Params>() } else { LIST_BYTES } as u32;
+const GRADS: u32 =
+    (PARAMS + if size_of::<Params>() > LIST_BYTES { size_of::<Params>() } else { LIST_BYTES } as u32).next_multiple_of(16);
 const _: () = assert!(GRADS.is_multiple_of(16));
 
 /// Which lobes and craters may reach each patch, a u16 per patch.
 const NEAR: u32 = GRADS + 256;
 
+/// One packed owner/source mapping for each face in a 16-face family.
+const FAMILY: u32 = NEAR + (PATCHES * 2).next_multiple_of(16) as u32;
+
 /// Shared bytes one scanning block takes.
-pub const SHARED: u32 = NEAR + (PATCHES * 2).next_multiple_of(16) as u32;
+pub const SHARED: u32 = FAMILY + 16 * 4;
 
 /// Runs of 32 consecutive blank vertices, one warp's share of a sculpt step.
 /// Subdivision numbers neighbours together, so a run covers one small patch
@@ -103,15 +106,27 @@ pub const MAX_HITS: usize = 16;
 /// Shared bytes the draw kernel takes per thread, its permutation strip.
 pub const DRAW_SHARED: u32 = 256;
 
+/// Packed topology routing for one face in a 16-face family: owner face and
+/// corner in the low byte, then three four-bit source lanes.
+#[cfg(any(test, target_arch = "nvptx64", target_arch = "amdgpu"))]
+const fn family_map(local: usize) -> u32 {
+    match local {
+        0 => 0x21000, 1 => 0x14310, 2 => 0x42520, 3 => 0x24101,
+        4 => 0x87611, 5 => 0x7a902, 6 => 0xa8304, 7 => 0x8a714,
+        8 => 0xdcb24, 9 => 0xce505, 10 => 0xed915, 11 => 0xdec08,
+        12 => 0x4a318, 13 => 0xae928, 14 => 0xe4519, _ => 0x4ea00,
+    }
+}
+
 /// The blank as the scan kernel reads it.
 ///
 /// Vertices come renumbered so that each run of 32, one warp's share of a
 /// sculpt step, sits in one small patch of the sphere, which lets the warp
 /// skip together the lobes and craters that cannot reach it. Renumbering moves
 /// no value, so the scan comes out bit for bit the same. A direction is its
-/// high halves and then its low halves, each padded to one 16 byte load, a
-/// face is three u16 vertex indices in one u64, and a patch is the center and
-/// chord radius of the ball around its run.
+/// high halves and then its low halves, each padded to one 16 byte load,
+/// face is three u16 indices in one u64, and a patch is the center and chord
+/// radius of the ball around its run.
 #[cfg(not(any(target_arch = "nvptx64", target_arch = "amdgpu")))]
 pub struct Packed {
     pub dirs: alloc::vec::Vec<f32>,
@@ -242,15 +257,18 @@ mod kernels {
     #[derive(Clone, Copy)]
     struct Quad([f32; 4]);
 
-    #[inline(always)]
-    fn dir(dirs: *const Quad, i: usize) -> [Split; 3] {
-        let (hi, lo) = unsafe { (*dirs.add(2 * i), *dirs.add(2 * i + 1)) };
-        core::array::from_fn(|k| Split { hi: hi.0[k], lo: lo.0[k] })
+    #[repr(C, align(16))]
+    #[derive(Clone, Copy)]
+    struct Direction {
+        hi: Quad,
+        lo: Quad,
     }
 
     #[inline(always)]
-    fn tri(tris: *const u64, t: usize) -> [usize; 3] {
-        unpack(unsafe { *tris.add(t) })
+    fn dir(dirs: *const Direction, i: usize) -> [Split; 3] {
+        let d = unsafe { *dirs.add(i) };
+        let (hi, lo) = (d.hi, d.lo);
+        core::array::from_fn(|k| Split { hi: hi.0[k], lo: lo.0[k] })
     }
 
     #[inline(always)]
@@ -259,19 +277,49 @@ mod kernels {
     }
 
     #[inline(always)]
-    fn vert(i: usize) -> [f32; 3] {
-        let a = VERTS + 12 * i as u32;
-        unsafe { [simt::ld_f32(a), simt::ld_f32(a + 4), simt::ld_f32(a + 8)] }
+    fn vert(dirs: *const Direction, params: &Params, i: usize) -> [f32; 3] {
+        let e = unsafe { simt::ld_f32(VERTS + 4 * i as u32) };
+        let d = dir(dirs, i);
+        core::array::from_fn(|k| params.position_component(d[k], k, e))
     }
 
     #[inline(always)]
-    fn set_vert(i: usize, v: [f32; 3]) {
-        let a = VERTS + 12 * i as u32;
-        unsafe {
-            simt::st_f32(a, v[0]);
-            simt::st_f32(a + 4, v[1]);
-            simt::st_f32(a + 8, v[2]);
-        }
+    fn set_vert(i: usize, e: f32) {
+        unsafe { simt::st_f32(VERTS + 4 * i as u32, e) };
+    }
+
+    /// Sixteen consecutive faces are the grandchildren of one subdivided
+    /// parent and contain only fifteen unique vertices. Give one to each of
+    /// the first fifteen lanes, then exchange the three each face needs.
+    #[inline(always)]
+    fn family_vertices(
+        tris: *const u64,
+        dirs: *const Direction,
+        params: &Params,
+        face: usize,
+    ) -> [[f32; 3]; 3] {
+        let lane = simt::laneid();
+        let local = (lane & 15) as usize;
+        let first = face - local;
+        let map = unsafe { simt::ld_u32(FAMILY + 4 * local as u32) };
+        let owner_face = (map & 15) as usize;
+        let owner_corner = (map >> 4 & 3) as usize;
+        let packed = unsafe { *tris.add(first + owner_face) };
+        let vertex = match owner_corner {
+            0 => packed as u16,
+            1 => (packed >> 16) as u16,
+            _ => (packed >> 32) as u16,
+        } as usize;
+        let owned = if local < 15 {
+            vert(dirs, params, vertex)
+        } else {
+            [0.0; 3]
+        };
+        let base = lane & !15;
+        let take = |source: u32| {
+            owned.map(|x| f32::from_bits(simt::shfl_idx(x.to_bits(), base + source)))
+        };
+        [take(map >> 8 & 15), take(map >> 12 & 15), take(map >> 16 & 15)]
     }
 
     /// One thread per nonce, parameters drawn into `params`.
@@ -300,7 +348,7 @@ mod kernels {
         count: u32,
     ) {
         let t = simt::tid() as usize;
-        let dirs = dirs as *const Quad;
+        let dirs = dirs as *const Direction;
         let warp = t / 32;
         let lane = simt::laneid() as usize;
         let mine = unsafe { stream.add((simt::ctaid() as usize * WARPS + warp) * STREAM * 20) };
@@ -309,6 +357,9 @@ mod kernels {
         if t < 64 {
             let row = &perlin::GRADS[t / 4].0;
             unsafe { simt::st_f32(GRADS + 4 * t as u32, row[t % 4]) };
+        }
+        if t < 16 {
+            unsafe { simt::st_u32(FAMILY + 4 * t as u32, family_map(t)) };
         }
 
         let mut n = simt::ctaid() as usize;
@@ -345,7 +396,8 @@ mod kernels {
                     next = dir(dirs, i + THREADS as usize);
                 }
                 let near = unsafe { simt::ld_u16(NEAR + 2 * (i / 32) as u32) } as u32;
-                set_vert(i, params.displace_with(d, &Shared, near));
+                let e = params.displacement_with(d, &Shared, near);
+                set_vert(i, e);
                 i += THREADS as usize;
             }
             simt::sync();
@@ -357,12 +409,9 @@ mod kernels {
             const _: () = assert!(N_FACES % STEP == 0);
             let mut body = Body::zero();
             let mut f = t;
-            let mut next = [tri(tris, f), tri(tris, f + THREADS as usize)];
             while f < N_FACES {
-                let [p, q] = next.map(|ix| ix.map(vert));
-                if f + STEP < N_FACES {
-                    next = [tri(tris, f + STEP), tri(tris, f + STEP + THREADS as usize)];
-                }
+                let p = family_vertices(tris, dirs, params, f);
+                let q = family_vertices(tris, dirs, params, f + THREADS as usize);
                 body.add(p[0], p[1], p[2]);
                 body.add(q[0], q[1], q[2]);
                 f += STEP;
@@ -380,7 +429,7 @@ mod kernels {
             // replay them. Apart, the walk's face latency and the sums' 96
             // running totals no longer share one register budget, and the sums
             // read the stream in lock step with every lane busy.
-            let streamed = walk(tris, per, c, stream);
+            let streamed = walk(dirs, params, tris, per, c, stream);
             simt::syncwarp();
 
             let mut acc = [0.0f32; SH];
@@ -485,8 +534,7 @@ mod kernels {
 
     /// A face relative to `c`, its first vertex and two edges, and its area.
     #[inline(always)]
-    fn face_at(ix: [usize; 3], c: [f32; 3]) -> ([f32; 3], [f32; 3], [f32; 3], f32) {
-        let [p0, p1, p2] = ix.map(vert);
+    fn face_from([p0, p1, p2]: [[f32; 3]; 3], c: [f32; 3]) -> ([f32; 3], [f32; 3], [f32; 3], f32) {
         let (e1, e2) = (sub(p1, p0), sub(p2, p0));
         let n = cross(e1, e2);
         (sub(p0, c), e1, e2, 0.5 * sqrtf(dot(n, n)))
@@ -507,20 +555,22 @@ mod kernels {
     /// Every face's first sample runs in step across the warp. The other three
     /// samples of each face split in two per side, about one face in seven,
     /// then run flattened over the warp's lanes rather than each lane walking
-    /// its own face while the rest idle. Those faces pass through shared
-    /// memory as vertex indices and are rebuilt.
+    /// its own face while the rest idle. Their source lanes pass through the
+    /// old reduction slots and their existing geometry moves by warp shuffle.
     #[inline(always)]
-    fn walk(tris: *const u64, per: f32, c: [f32; 3], stream: Stream) -> usize {
+    fn walk(
+        dirs: *const Direction,
+        params: &Params,
+        tris: *const u64,
+        per: f32,
+        c: [f32; 3],
+        stream: Stream,
+    ) -> usize {
         let lane = simt::laneid();
         let mut streamed = 0;
         let mut t = simt::tid() as usize;
-        let mut next = unsafe { *tris.add(t) };
         while t < N_FACES {
-            let packed = next;
-            if t + (THREADS as usize) < N_FACES {
-                next = unsafe { *tris.add(t + THREADS as usize) };
-            }
-            let (a, e1, e2, area) = face_at(unpack(packed), c);
+            let (a, e1, e2, area) = face_from(family_vertices(tris, dirs, params, t), c);
             // k = ceil(sqrt(area / per)), the subdivision per side, by compares
             // for the two sizes every measured face takes.
             let k = if area <= per {
@@ -533,7 +583,12 @@ mod kernels {
 
             let split = simt::ballot(k == 2);
             if k == 2 {
-                unsafe { simt::st_u64(list() + 8 * (split & simt::lanemask_lt()).count_ones(), packed) };
+                unsafe {
+                    simt::st_u8(
+                        list() + (split & simt::lanemask_lt()).count_ones(),
+                        lane as u8,
+                    )
+                };
             }
             let big = simt::ballot(k > 2);
             let (w, step) = match k {
@@ -548,8 +603,8 @@ mod kernels {
             let mut s = lane;
             while s < extras.next_multiple_of(32) {
                 let live = s < extras;
-                let packed = unsafe { simt::ld_u64(list() + 8 * if live { s / 3 } else { 0 }) };
-                let (a, e1, e2, area) = face_at(unpack(packed), c);
+                let source = unsafe { simt::ld_u8(list() + if live { s / 3 } else { 0 }) } as u32;
+                let (a, e1, e2, area) = face_from_lane(a, e1, e2, area, source);
                 let (i, j, down) = SPLIT_TWO[(s % 3) as usize];
                 streamed = put(stream, streamed, bary(a, e1, e2, 1.0 / 6.0, i, j, down), area * 0.25, live);
                 s += 32;
@@ -563,8 +618,7 @@ mod kernels {
                 let o = big.trailing_zeros();
                 big &= big - 1;
                 let ko = simt::shfl_idx(k, o);
-                let face = simt::shfl_idx(t as u32, o) as usize;
-                let (a, e1, e2, area) = face_at(unpack(unsafe { *tris.add(face) }), c);
+                let (a, e1, e2, area) = face_from_lane(a, e1, e2, area, o);
                 let mut q = 1 + lane;
                 while q < 1 + (ko * ko - 1).next_multiple_of(32) {
                     let live = q < ko * ko;
@@ -599,12 +653,19 @@ mod kernels {
     /// This warp's list of split faces.
     #[inline(always)]
     fn list() -> u32 {
-        LIST + 8 * 32 * (simt::tid() / 32)
+        LIST + 32 * (simt::tid() / 32)
     }
 
     #[inline(always)]
-    fn unpack(v: u64) -> [usize; 3] {
-        [(v & 0xffff) as usize, (v >> 16 & 0xffff) as usize, (v >> 32 & 0xffff) as usize]
+    fn face_from_lane(
+        a: [f32; 3],
+        e1: [f32; 3],
+        e2: [f32; 3],
+        area: f32,
+        source: u32,
+    ) -> ([f32; 3], [f32; 3], [f32; 3], f32) {
+        let take = |x: f32| f32::from_bits(simt::shfl_idx(x.to_bits(), source));
+        (a.map(take), e1.map(take), e2.map(take), take(area))
     }
 
     /// Samples one to three of a face split in two per side.
@@ -727,5 +788,28 @@ mod kernels {
         let lo = simt::shfl_xor(bits as u32, mask) as u64;
         let hi = simt::shfl_xor((bits >> 32) as u32, mask) as u64;
         f64::from_bits(hi << 32 | lo)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::family_map;
+    use crate::topology::build;
+
+    #[test]
+    fn family_map_reconstructs_every_face() {
+        let (_, flat) = build();
+        let faces = flat.as_chunks::<3>().0;
+        for family in faces.chunks_exact(16) {
+            let owned: [u32; 16] = core::array::from_fn(|local| {
+                let map = family_map(local);
+                family[(map & 15) as usize][(map >> 4 & 3) as usize]
+            });
+            for (local, face) in family.iter().enumerate() {
+                let map = family_map(local);
+                let rebuilt = [owned[(map >> 8 & 15) as usize], owned[(map >> 12 & 15) as usize], owned[(map >> 16 & 15) as usize]];
+                assert_eq!(&rebuilt, face, "family face {local}");
+            }
+        }
     }
 }

@@ -101,7 +101,7 @@ impl Params {
     /// lobes and craters set in `near`, as `near` reports them, are looked at.
     /// The rest must add exactly zero at these vertices.
     #[inline(always)]
-    pub fn displace_with<T: Real>(&self, dir: [Split<T>; 3], lattice: &impl Lattice<T>, near: u32) -> [T; 3] {
+    pub fn displacement_with<T: Real>(&self, dir: [Split<T>; 3], lattice: &impl Lattice<T>, near: u32) -> T {
         let zero = T::splat(0.0);
         let mut lobes = zero;
         for (k, lobe) in self.lobes.iter().enumerate() {
@@ -144,10 +144,23 @@ impl Params {
 
         let e = self.noise_amplitude.scale(self.fbm.get(dir, lattice) + craters) + lobes;
         let least = T::splat(MIN_RADIUS - 1.0);
-        let e = T::select(e.gt(least), e, least);
+        T::select(e.gt(least), e, least)
+    }
+
+    /// One coordinate at displacement `e`. Keeping this operation separate
+    /// lets a GPU retain a compact vertex record and reconstruct only the
+    /// coordinates a later pass did not store.
+    #[inline(always)]
+    pub fn position_component<T: Real>(&self, dir: Split<T>, axis: usize, e: T) -> T {
+        let s = dir * self.axis_scale[axis];
+        s.hi + s.hi.fma(e, s.lo * (T::splat(1.0) + e))
+    }
+
+    #[inline(always)]
+    pub fn displace_with<T: Real>(&self, dir: [Split<T>; 3], lattice: &impl Lattice<T>, near: u32) -> [T; 3] {
+        let e = self.displacement_with(dir, lattice, near);
         core::array::from_fn(|k| {
-            let s = dir[k] * self.axis_scale[k];
-            s.hi + s.hi.fma(e, s.lo * (T::splat(1.0) + e))
+            self.position_component(dir[k], k, e)
         })
     }
 
