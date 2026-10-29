@@ -248,6 +248,8 @@ Consumer GPUs run f64 at 1/16 to 1/64 of their f32 rate, so the kernels compute 
 
 Effective hash rate is hash rate times retention, the share of nonces where the kernel agrees with the chain. Retention is a price, not a gate. A variant that trades some for more speed wins when the product grows.
 
+Each GPU launch retains up to 16 valid results instead of silently dropping every result after the first. Results completed after an upstream job change are discarded locally before submission.
+
 The optimized GPU kernel keeps the same arithmetic while storing compact scalar vertex displacements and sharing exact coordinate reconstruction across fixed 16-face icosphere families. On the reference RX 7900 XT this increased measured end-to-end throughput by 6.375% with byte-identical GPU feature dumps. AMD mining also pipelines dispatch and pinned readback on one ordered HIP stream; scan kernels never overlap.
 
 The gfx1100 kernel also evaluates one statistically ranked adjacent quantization bucket when a feature lies close to a measured boundary. GPU candidates are deduplicated and recomputed canonically before submission. Three RX 7900 XT samples improved canonical coverage from 94.1–94.6% to 99.35–99.49%. This calibrated profile is enabled only for gfx1100; every other AMD architecture and NVIDIA keep the single-bucket kernel.
@@ -263,7 +265,7 @@ Stable Rust builds the miner and the harness with no CUDA toolkit or ROCm. The P
 ### PTX
 
 ```bash
-rustup toolchain install nightly --component rust-src --component llvm-bitcode-linker
+rustup toolchain install nightly-2026-08-27 --component rust-src --component llvm-bitcode-linker
 ./scripts/build-ptx.sh
 ```
 
@@ -272,7 +274,7 @@ The script stages `modern.ptx` for Volta and newer and `legacy.ptx`, built for s
 ### AMD code objects
 
 ```bash
-rustup toolchain install nightly --component rust-src --component llvm-tools
+rustup toolchain install nightly-2026-08-27 --component rust-src --component llvm-tools
 ./scripts/build-gfx.sh
 ```
 
