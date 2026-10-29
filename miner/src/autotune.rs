@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CACHE_SCHEMA: u32 = 1;
@@ -253,13 +253,12 @@ fn select(base: u32, scores: &[Score]) -> Option<&Score> {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    #[cfg(not(windows))]
-    let root = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
-    root.map(|root| root.join("numen-miner").join("autotune.json"))
+    let executable = std::env::current_exe().ok()?;
+    cache_path_for_executable(&executable)
+}
+
+fn cache_path_for_executable(executable: &Path) -> Option<PathBuf> {
+    executable.parent().map(|directory| directory.join("autotune.json"))
 }
 
 #[cfg(test)]
@@ -285,5 +284,11 @@ mod tests {
     #[test]
     fn median_rejects_one_outlier() {
         assert_eq!(median(&[1.0, 9.0, 1.1]), Some(1.1));
+    }
+
+    #[test]
+    fn cache_lives_beside_the_executable() {
+        let executable = Path::new("install").join("numen-miner.exe");
+        assert_eq!(cache_path_for_executable(&executable), Some(Path::new("install").join("autotune.json")));
     }
 }
