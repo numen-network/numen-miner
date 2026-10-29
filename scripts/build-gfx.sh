@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+GPU_TOOLCHAIN="${GPU_TOOLCHAIN:-nightly-2026-08-27}"
+
 OUT="miner/gfx"
 mkdir -p "$OUT"
 
@@ -18,8 +20,8 @@ if [ $# -gt 0 ]; then
     TARGETS=("$@")
 fi
 
-HOST="$(rustc +nightly -vV | sed -n 's/^host: //p')"
-BIN="$(rustc +nightly --print sysroot)/lib/rustlib/$HOST/bin"
+HOST="$(rustc +"$GPU_TOOLCHAIN" -vV | sed -n 's/^host: //p')"
+BIN="$(rustc +"$GPU_TOOLCHAIN" --print sysroot)/lib/rustlib/$HOST/bin"
 PY="$(command -v python || command -v python3)"
 
 # rustc has no way to give a kernel its block size, and LLVM otherwise plans
@@ -31,7 +33,7 @@ for gfx in "${TARGETS[@]}"; do
     mkdir -p "$DIR"
     RUSTFLAGS="-Ctarget-cpu=$gfx -Cllvm-args=-unroll-threshold=2000" \
     CARGO_TARGET_DIR="$DIR" \
-    cargo +nightly rustc \
+    cargo +"$GPU_TOOLCHAIN" rustc \
         -p numen-kernel \
         --release \
         --target amdgcn-amd-amdhsa \

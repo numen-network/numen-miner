@@ -3,9 +3,14 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# The GPU ABI and LLVM intrinsics are nightly surfaces. Pin the toolchain so a
+# future nightly cannot silently change generated kernels or stop old releases
+# from rebuilding.
+GPU_TOOLCHAIN="${GPU_TOOLCHAIN:-nightly-2026-08-27}"
+
 # Full unrolling keeps the per nonce arrays in registers. At its default
 # threshold LLVM rolls them back into loops over local memory.
-RUSTFLAGS="-Ctarget-cpu=sm_70 -Cllvm-args=-unroll-threshold=2000" cargo +nightly rustc \
+RUSTFLAGS="-Ctarget-cpu=sm_70 -Cllvm-args=-unroll-threshold=2000" cargo +"$GPU_TOOLCHAIN" rustc \
     -p numen-kernel \
     --release \
     --target nvptx64-nvidia-cuda \
