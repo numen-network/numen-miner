@@ -414,7 +414,7 @@ fn blank() -> Packed {
 /// A launch over the nonces from `start`. A dump reads the sums, so the
 /// threshold never matters.
 fn dump_job(pre_hash: &[u8; 32], start: u64) -> Job {
-    Job { pre_hash: *pre_hash, threshold: [0; 32], nonce_start: [start, 0, 0, 0] }
+    Job { pre_hash: *pre_hash, threshold: [0; 32], nonce_start: [start, 0, 0, 0], generation: 0 }
 }
 
 /// Features of every nonce in a launch, from its sums as they came off the

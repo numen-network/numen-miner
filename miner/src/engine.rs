@@ -16,6 +16,7 @@ pub struct Job {
     pub pre_hash: [u8; 32],
     pub threshold: [u8; 32],
     pub nonce_start: Nonce,
+    pub generation: u64,
 }
 
 pub struct ActiveTask {
@@ -144,6 +145,10 @@ pub struct Shared {
     /// and reset under its write lock, so no job pairs a task with nonces
     /// counted for another.
     cursor: AtomicU64,
+    /// Changes whenever the active task or link changes. Results from an
+    /// already queued GPU launch can then be discarded locally instead of
+    /// being submitted as guaranteed-stale work.
+    generation: AtomicU64,
     /// Nonce limbs 1 and 2, drawn once per process.
     limbs: [u64; 2],
     submit: RwLock<Option<Submit>>,
@@ -156,6 +161,7 @@ impl Shared {
         Shared {
             task: RwLock::new(None),
             cursor: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
             limbs: [random_limb(), random_limb()],
             submit: RwLock::new(None),
             meters: Mutex::new(Vec::new()),
@@ -172,6 +178,7 @@ impl Shared {
             self.cursor.store(0, Ordering::Relaxed);
         }
         *guard = Some(ActiveTask { pre_hash, threshold, extranonce });
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn next_job(&self, count: u64) -> Option<Job> {
@@ -183,6 +190,7 @@ impl Shared {
             pre_hash: task.pre_hash,
             threshold: task.threshold,
             nonce_start: [start, a, b, task.extranonce],
+            generation: self.generation.load(Ordering::Relaxed),
         })
     }
 
@@ -224,11 +232,16 @@ impl Shared {
     pub fn detach(&self) {
         *self.submit.write().expect("submit lock") = None;
         *self.task.write().expect("task lock") = None;
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Send a hit upstream from the worker that found it. With no link up the
     /// hit is lost, as it would be stale by the time one came back.
     pub fn found(self: &Arc<Self>, meter: &Arc<Meter>, job: &Job, hit: Candidate) {
+        if self.generation.load(Ordering::Relaxed) != job.generation {
+            log::debug!("{} stale hit dropped after a task change", meter.name);
+            return;
+        }
         let share = Share { meter: meter.clone(), pre_hash: job.pre_hash, nonce: hit.nonce, work: hit.work };
         match &*self.submit.read().expect("submit lock") {
             Some(submit) => submit(self, share),
