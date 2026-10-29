@@ -10,7 +10,10 @@ use libloading::Library;
 use numen_kernel::coop::{self, MAX_HITS, Packed, SERIAL_BLOCK, Sums};
 use numen_kernel::pipeline::N_FEATURES;
 use numen_kernel::sculpt::Params;
+use numen_kernel::work::meets;
 use nvml_wrapper::Nvml;
+use poscan::Compute;
+use primitive_types::{H256, U256};
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fmt;
@@ -500,6 +503,18 @@ fn features_from(sums: &[u8]) -> Vec<Option<[f64; N_FEATURES]>> {
         .collect()
 }
 
+fn canonical_hits(job: &Job, mut hits: Vec<Candidate>) -> Vec<Candidate> {
+    hits.sort_unstable_by_key(|hit| hit.nonce);
+    hits.dedup_by_key(|hit| hit.nonce);
+    hits.into_iter()
+        .filter_map(|hit| {
+            let compute = Compute { pre_hash: H256::from(job.pre_hash), nonce: U256(hit.nonce) };
+            let work = compute.work()?.0;
+            meets(&work, &job.threshold).then_some(Candidate { nonce: hit.nonce, work })
+        })
+        .collect()
+}
+
 pub fn cuda_worker(shared: Arc<Shared>, meter: Arc<Meter>, mut backend: CudaBackend) {
     let lanes = backend.lanes as u64;
     // One launch stays queued behind the one being collected, so the GPU never
@@ -521,7 +536,7 @@ pub fn cuda_worker(shared: Arc<Shared>, meter: Arc<Meter>, mut backend: CudaBack
             match backend.collect() {
                 Ok(hits) => {
                     meter.add(lanes);
-                    for hit in hits {
+                    for hit in canonical_hits(&job, hits) {
                         shared.found(&meter, &job, hit);
                     }
                 }
@@ -1155,7 +1170,7 @@ pub fn hip_worker(shared: Arc<Shared>, meter: Arc<Meter>, mut backend: HipBacken
             match backend.collect() {
                 Ok(hits) => {
                     meter.add(lanes);
-                    for hit in hits {
+                    for hit in canonical_hits(&job, hits) {
                         shared.found(&meter, &job, hit);
                     }
                 }
@@ -1180,6 +1195,23 @@ pub fn hip_worker(shared: Arc<Shared>, meter: Arc<Meter>, mut backend: HipBacken
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_filter_deduplicates_and_replaces_gpu_work() {
+        let job = Job {
+            pre_hash: [0x2a; 32],
+            threshold: [0xff; 32],
+            nonce_start: [0; 4],
+            generation: 0,
+        };
+        let nonce = [7, 0, 0, 0];
+        let hits = vec![Candidate { nonce, work: [0; 32] }, Candidate { nonce, work: [1; 32] }];
+        let verified = canonical_hits(&job, hits);
+        assert_eq!(verified.len(), 1);
+        let expected = Compute { pre_hash: H256::from(job.pre_hash), nonce: U256(nonce) }.work().unwrap().0;
+        assert_eq!(verified[0].nonce, nonce);
+        assert_eq!(verified[0].work, expected);
+    }
 
     #[test]
     fn autotune_candidates_span_the_base() {

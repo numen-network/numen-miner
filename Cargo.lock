@@ -1377,6 +1377,7 @@ dependencies = [
  "numen-kernel",
  "nvml-wrapper",
  "parity-scale-codec",
+ "poscan",
  "primitive-types",
  "reqwest",
  "rustls-platform-verifier",
