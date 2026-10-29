@@ -1,6 +1,6 @@
 use anyhow::{Result, ensure};
 use clap::builder::BoolishValueParser;
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use std::num::ParseIntError;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
@@ -39,6 +39,12 @@ pub struct Cli {
     #[arg(long, short = 'p', env = "NUMEN_MINER_PASS", default_value = "x")]
     pub pass: String,
 
+    /// How devices share upstream connections. `auto` gives every device its
+    /// own connection when any Stratum URL is configured, `rig` keeps one
+    /// connection for the whole process, and `device` always separates them.
+    #[arg(long, env = "NUMEN_MINER_WORKER_MODE", default_value = "auto")]
+    pub worker_mode: WorkerMode,
+
     #[command(flatten)]
     pub rig: Rig,
 
@@ -59,6 +65,23 @@ pub struct Cli {
     /// ten under `--temp-stop`.
     #[arg(long, env = "NUMEN_MINER_TEMP_START", requires = "temp_stop")]
     pub temp_start: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum WorkerMode {
+    Auto,
+    Rig,
+    Device,
+}
+
+impl WorkerMode {
+    pub fn per_device(self, endpoints: &[Endpoint]) -> bool {
+        match self {
+            WorkerMode::Auto => endpoints.iter().any(Endpoint::is_stratum),
+            WorkerMode::Rig => false,
+            WorkerMode::Device => true,
+        }
+    }
 }
 
 impl Cli {
@@ -233,4 +256,32 @@ fn pre_hash(s: &str) -> Result<[u8; 32], hex::FromHexError> {
     let mut out = [0u8; 32];
     hex::decode_to_slice(format!("{:0>64}", s.strip_prefix("0x").unwrap_or(s)), &mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkerMode;
+    use crate::upstream::Endpoint;
+
+    fn endpoint(url: &str) -> Endpoint {
+        url.parse().unwrap()
+    }
+
+    #[test]
+    fn auto_separates_devices_when_stratum_is_available() {
+        assert!(WorkerMode::Auto.per_device(&[endpoint("stratum+ssl://pool.example:1234")]));
+        assert!(WorkerMode::Auto.per_device(&[
+            endpoint("ws://127.0.0.1:9944"),
+            endpoint("stratum+tcp://pool.example:1234"),
+        ]));
+        assert!(!WorkerMode::Auto.per_device(&[endpoint("ws://127.0.0.1:9944")]));
+    }
+
+    #[test]
+    fn explicit_worker_modes_override_detection() {
+        let node = [endpoint("ws://127.0.0.1:9944")];
+        let pool = [endpoint("stratum+ssl://pool.example:1234")];
+        assert!(WorkerMode::Device.per_device(&node));
+        assert!(!WorkerMode::Rig.per_device(&pool));
+    }
 }

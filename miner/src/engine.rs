@@ -22,6 +22,7 @@ pub struct Job {
 pub struct ActiveTask {
     pub pre_hash: [u8; 32],
     pub threshold: [u8; 32],
+    pub difficulty: U256,
     pub extranonce: u64,
 }
 
@@ -45,6 +46,7 @@ pub struct Meter {
     pub name: String,
     pub bus: String,
     pub batch: Option<u32>,
+    worker: Mutex<Option<String>>,
     scanned: AtomicU64,
     accepted: AtomicU64,
     rejected: AtomicU64,
@@ -67,6 +69,7 @@ impl Meter {
             name,
             bus,
             batch,
+            worker: Mutex::new(None),
             scanned: AtomicU64::new(0),
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
@@ -80,6 +83,14 @@ impl Meter {
 
     pub fn add(&self, n: u64) {
         self.scanned.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn set_worker(&self, worker: Option<String>) {
+        *self.worker.lock().expect("worker lock") = worker;
+    }
+
+    pub fn worker(&self) -> Option<String> {
+        self.worker.lock().expect("worker lock").clone()
     }
 
     pub fn scanned(&self) -> u64 {
@@ -157,7 +168,7 @@ pub struct Shared {
     /// already queued GPU launch can then be discarded locally instead of
     /// being submitted as guaranteed-stale work.
     generation: AtomicU64,
-    /// Nonce limbs 1 and 2, drawn once per process.
+    /// Nonce limbs 1 and 2, drawn once per independently scheduled group.
     limbs: [u64; 2],
     submit: RwLock<Option<Submit>>,
     meters: Mutex<Vec<Arc<Meter>>>,
@@ -185,8 +196,12 @@ impl Shared {
         if guard.as_ref().is_none_or(|t| t.pre_hash != pre_hash) {
             self.cursor.store(0, Ordering::Relaxed);
         }
-        *guard = Some(ActiveTask { pre_hash, threshold, extranonce });
+        *guard = Some(ActiveTask { pre_hash, threshold, difficulty, extranonce });
         self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn difficulty(&self) -> Option<U256> {
+        self.task.read().expect("task lock").as_ref().map(|task| task.difficulty)
     }
 
     pub fn next_job(&self, count: u64) -> Option<Job> {
@@ -215,6 +230,12 @@ impl Shared {
     pub fn reset_scanned(&self, now: Instant) {
         for meter in self.meters() {
             meter.reset_scanned(now);
+        }
+    }
+
+    pub fn set_worker(&self, worker: Option<String>) {
+        for meter in self.meters() {
+            meter.set_worker(worker.clone());
         }
     }
 
@@ -275,6 +296,57 @@ impl Shared {
         let (a, r) = self.verdicts();
         let reason = reason.map(|reason| format!(", {reason}")).unwrap_or_default();
         log::info!("{} {verdict} ({a}/{r}) {} ms{reason}", meter.name, sent.elapsed().as_millis());
+    }
+}
+
+/// The independently scheduled device groups in one miner process. A group is
+/// one Stratum connection in per-device mode, or every device together in rig
+/// mode.
+#[derive(Clone)]
+pub struct Farm {
+    groups: Arc<Vec<Arc<Shared>>>,
+}
+
+impl Farm {
+    pub fn new(groups: Vec<Arc<Shared>>) -> Self {
+        Farm { groups: Arc::new(groups) }
+    }
+
+    pub fn groups(&self) -> &[Arc<Shared>] {
+        &self.groups
+    }
+
+    pub fn meters(&self) -> Vec<Arc<Meter>> {
+        self.groups.iter().flat_map(|group| group.meters()).collect()
+    }
+
+    pub fn reset_scanned(&self, now: Instant) {
+        for group in self.groups.iter() {
+            group.reset_scanned(now);
+        }
+    }
+
+    pub fn rate(&self, now: Instant) -> f64 {
+        self.groups.iter().map(|group| group.rate(now)).sum()
+    }
+
+    pub fn verdicts(&self) -> (u64, u64) {
+        self.groups.iter().fold((0, 0), |(accepted, rejected), group| {
+            let (a, r) = group.verdicts();
+            (accepted + a, rejected + r)
+        })
+    }
+
+    pub fn set_task(&self, pre_hash: [u8; 32], difficulty: U256, extranonce: u64) {
+        for group in self.groups.iter() {
+            group.set_task(pre_hash, difficulty, extranonce);
+        }
+    }
+
+    pub fn stop(&self) {
+        for group in self.groups.iter() {
+            group.stop();
+        }
     }
 }
 

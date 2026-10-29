@@ -13,7 +13,7 @@ mod upstream;
 use clap::Parser;
 use cli::{Bench, Command, Cli, GpuChoice, Rig, VERSION};
 use comfy_table::Table;
-use engine::Shared;
+use engine::{Farm, Shared};
 use nvml_wrapper::Nvml;
 use primitive_types::U256;
 use serde::Serialize;
@@ -62,24 +62,20 @@ fn list_devices() {
 }
 
 async fn bench(args: &Bench) {
-    let shared = Arc::new(Shared::new());
-    shared.set_task([0; 32], U256::MAX, 0);
-    let workers = spawn_workers(&args.rig, &shared);
+    let mut running = spawn_workers(&args.rig, true);
+    running.farm.set_task([0; 32], U256::MAX, 0);
     let started = Instant::now();
-    shared.reset_scanned(started);
+    running.farm.reset_scanned(started);
 
     tokio::select! {
-        _ = report_loop(shared.clone(), args.report_interval, None) => {}
+        _ = report_loop(running.farm.clone(), args.report_interval, None) => {}
         _ = tokio::signal::ctrl_c() => log::info!("shutting down"),
         _ = benchmark_deadline(args.duration) => log::info!("benchmark duration complete"),
     }
 
-    shared.stop();
-    for w in workers {
-        let _ = w.join();
-    }
-    let report = benchmark_report(&shared, started.elapsed());
-    log::info!("final benchmark\n{}", speed_report(&shared));
+    running.stop();
+    let report = benchmark_report(&running.farm, started.elapsed());
+    log::info!("final benchmark\n{}", speed_report(&running.farm));
     if let Some(path) = &args.json
         && let Err(e) = write_benchmark(path, &report)
     {
@@ -118,9 +114,9 @@ struct BenchmarkDevice {
     power: Option<f64>,
 }
 
-fn benchmark_report(shared: &Shared, duration: Duration) -> BenchmarkReport {
+fn benchmark_report(farm: &Farm, duration: Duration) -> BenchmarkReport {
     let seconds = duration.as_secs_f64();
-    let devices = shared
+    let devices = farm
         .meters()
         .iter()
         .map(|meter| {
@@ -166,33 +162,78 @@ async fn work(cli: &Cli) {
             std::process::exit(1);
         }
     };
-    let shared = Arc::new(Shared::new());
-    let workers = spawn_workers(&cli.rig, &shared);
+    let per_device = cli.worker_mode.per_device(&cli.url);
+    log::info!(
+        "worker connections: {}",
+        if per_device { "one per device" } else { "one for the rig" }
+    );
+    let mut running = spawn_workers(&cli.rig, per_device);
+    let connections = connections(&upstream, &running.farm, per_device);
 
-    tokio::spawn(api::serve(shared.clone(), cli.api_port));
+    tokio::spawn(api::serve(running.farm.clone(), cli.api_port));
 
     tokio::select! {
-        _ = upstream.run(&shared) => {}
-        _ = report_loop(shared.clone(), cli.report_interval, limit) => {}
+        _ = run_upstreams(connections) => {}
+        _ = report_loop(running.farm.clone(), cli.report_interval, limit) => {}
         _ = tokio::signal::ctrl_c() => log::info!("shutting down"),
     }
 
-    shared.stop();
-    for w in workers {
-        let _ = w.join();
+    running.stop();
+}
+
+struct RunningRig {
+    farm: Farm,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl RunningRig {
+    fn stop(&mut self) {
+        self.farm.stop();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 }
 
-fn spawn_workers(rig: &Rig, shared: &Arc<Shared>) -> Vec<JoinHandle<()>> {
+fn spawn_workers(rig: &Rig, per_device: bool) -> RunningRig {
+    if !per_device {
+        let shared = Arc::new(Shared::new());
+        let workers = spawn_grouped_workers(rig, &shared);
+        if workers.is_empty() {
+            log::warn!("no device to mine on, add --cpu to mine on the CPU");
+        }
+        return RunningRig { farm: Farm::new(vec![shared]), workers };
+    }
+
+    let mut groups = Vec::new();
+    let mut workers = Vec::new();
+    if rig.cpu {
+        let shared = Arc::new(Shared::new());
+        let cpu = spawn_cpu_workers(rig.cpus.cpu_threads(), &shared);
+        if !cpu.is_empty() {
+            groups.push(shared);
+            workers.extend(cpu);
+        }
+    }
+    if !rig.no_gpu {
+        let (gpu_groups, gpu_workers) = spawn_gpu_groups(&rig.gpus);
+        groups.extend(gpu_groups);
+        workers.extend(gpu_workers);
+    }
+    if workers.is_empty() {
+        log::warn!("no device to mine on, add --cpu to mine on the CPU");
+        groups.push(Arc::new(Shared::new()));
+    }
+    RunningRig { farm: Farm::new(groups), workers }
+}
+
+fn spawn_grouped_workers(rig: &Rig, shared: &Arc<Shared>) -> Vec<JoinHandle<()>> {
     let mut workers = Vec::new();
     if rig.cpu {
         workers.extend(spawn_cpu_workers(rig.cpus.cpu_threads(), shared));
     }
     if !rig.no_gpu {
         workers.extend(spawn_gpu_workers(&rig.gpus, shared));
-    }
-    if workers.is_empty() {
-        log::warn!("no device to mine on, add --cpu to mine on the CPU");
     }
     workers
 }
@@ -206,24 +247,15 @@ fn spawn_gpu_workers(choice: &GpuChoice, shared: &Arc<Shared>) -> Vec<JoinHandle
         .filter(|(number, _)| choice.mines_on_gpu(*number));
     let mut workers = Vec::new();
     for (position, (number, gpu)) in gpus.enumerate() {
-        let lanes = choice.lanes_for(position);
-        let shared = shared.clone();
-        let worker = match gpu {
-            Gpu::Cuda(device) => gpu::CudaBackend::new(number, &device, lanes, choice.retune).map(|backend| {
-                let sensor = nvml.as_ref().map(|nvml| device.sensor(nvml));
-                let meter = shared.meter(format!("gpu{number}"), device.bus(), Some(backend.lanes()), sensor);
-                std::thread::spawn(move || cuda_worker(shared, meter, backend))
-            }),
-            Gpu::Hip(device) => gpu::HipBackend::new(number, &device, lanes, choice.retune).map(|backend| {
-                let meter = shared.meter(
-                    format!("gpu{number}"),
-                    device.bus(),
-                    Some(backend.lanes()),
-                    device.sensor(&amd_sensors),
-                );
-                std::thread::spawn(move || hip_worker(shared, meter, backend))
-            }),
-        };
+        let worker = spawn_gpu_worker(
+            number,
+            gpu,
+            choice.lanes_for(position),
+            choice.retune,
+            shared.clone(),
+            nvml.as_ref(),
+            &amd_sensors,
+        );
         match worker {
             Ok(worker) => workers.push(worker),
             Err(e) => log::error!("gpu{number}: {e:#}"),
@@ -232,7 +264,92 @@ fn spawn_gpu_workers(choice: &GpuChoice, shared: &Arc<Shared>) -> Vec<JoinHandle
     workers
 }
 
-async fn report_loop(shared: Arc<Shared>, interval: u64, limit: Option<TempLimit>) {
+fn spawn_gpu_groups(choice: &GpuChoice) -> (Vec<Arc<Shared>>, Vec<JoinHandle<()>>) {
+    let nvml = if std::env::var_os("NUMEN_NO_NVML").is_some() { None } else { Nvml::init().ok().map(Arc::new) };
+    let amd_sensors = AmdSensors::new();
+    let gpus = gpu::gpus()
+        .into_iter()
+        .enumerate()
+        .filter(|(number, _)| choice.mines_on_gpu(*number));
+    let mut groups = Vec::new();
+    let mut workers = Vec::new();
+    for (position, (number, gpu)) in gpus.enumerate() {
+        let shared = Arc::new(Shared::new());
+        match spawn_gpu_worker(
+            number,
+            gpu,
+            choice.lanes_for(position),
+            choice.retune,
+            shared.clone(),
+            nvml.as_ref(),
+            &amd_sensors,
+        ) {
+            Ok(worker) => {
+                groups.push(shared);
+                workers.push(worker);
+            }
+            Err(e) => log::error!("gpu{number}: {e:#}"),
+        }
+    }
+    (groups, workers)
+}
+
+fn spawn_gpu_worker(
+    number: usize,
+    gpu: Gpu,
+    lanes: Option<u32>,
+    retune: bool,
+    shared: Arc<Shared>,
+    nvml: Option<&Arc<Nvml>>,
+    amd_sensors: &AmdSensors,
+) -> anyhow::Result<JoinHandle<()>> {
+    match gpu {
+        Gpu::Cuda(device) => gpu::CudaBackend::new(number, &device, lanes, retune).map(|backend| {
+            let sensor = nvml.map(|nvml| device.sensor(nvml));
+            let meter = shared.meter(format!("gpu{number}"), device.bus(), Some(backend.lanes()), sensor);
+            std::thread::spawn(move || cuda_worker(shared, meter, backend))
+        }),
+        Gpu::Hip(device) => gpu::HipBackend::new(number, &device, lanes, retune).map(|backend| {
+            let meter = shared.meter(
+                format!("gpu{number}"),
+                device.bus(),
+                Some(backend.lanes()),
+                device.sensor(amd_sensors),
+            );
+            std::thread::spawn(move || hip_worker(shared, meter, backend))
+        }),
+    }
+}
+
+fn connections(upstream: &Upstream, farm: &Farm, per_device: bool) -> Vec<(Upstream, Arc<Shared>)> {
+    farm.groups()
+        .iter()
+        .map(|shared| {
+            let device = shared
+                .meters()
+                .first()
+                .map(|meter| meter.name.clone())
+                .unwrap_or_else(|| "rig".into());
+            let upstream = if per_device { upstream.for_device(&device) } else { upstream.clone() };
+            shared.set_worker(upstream.worker());
+            (upstream, shared.clone())
+        })
+        .collect()
+}
+
+async fn run_upstreams(connections: Vec<(Upstream, Arc<Shared>)>) {
+    let mut links = tokio::task::JoinSet::new();
+    for (upstream, shared) in connections {
+        links.spawn(async move { upstream.run(&shared).await });
+    }
+    while let Some(result) = links.join_next().await {
+        if let Err(e) = result {
+            log::error!("upstream task failed: {e}");
+        }
+    }
+}
+
+async fn report_loop(farm: Farm, interval: u64, limit: Option<TempLimit>) {
     let every = Duration::from_secs(interval.max(1));
     let mut sample = tokio::time::interval(Duration::from_secs(1));
     let mut report = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
@@ -240,21 +357,21 @@ async fn report_loop(shared: Arc<Shared>, interval: u64, limit: Option<TempLimit
         tokio::select! {
             _ = sample.tick() => {
                 let now = Instant::now();
-                for meter in shared.meters() {
+                for meter in farm.meters() {
                     meter.sample(now);
                     meter.sense(now, limit);
                 }
             }
-            _ = report.tick() => log::info!("{}", speed_report(&shared)),
+            _ = report.tick() => log::info!("{}", speed_report(&farm)),
         }
     }
 }
 
-fn speed_report(shared: &Shared) -> String {
+fn speed_report(farm: &Farm) -> String {
     let now = Instant::now();
     let mut table = Table::new();
     table.set_header(["Device", "Bus", "Speed", "Accepted", "Rejected", "Temp", "Fan", "Power"]);
-    for meter in shared.meters() {
+    for meter in farm.meters() {
         let reading = meter.reading();
         table.add_row([
             meter.name.clone(),
@@ -267,8 +384,8 @@ fn speed_report(shared: &Shared) -> String {
             reading.power.map_or("n/a".into(), |power| format!("{power:.0} W")),
         ]);
     }
-    let (accepted, rejected) = shared.verdicts();
-    format!("speed {}, accepted {accepted}, rejected {rejected}\n{table}", hashrate(shared.rate(now)))
+    let (accepted, rejected) = farm.verdicts();
+    format!("speed {}, accepted {accepted}, rejected {rejected}\n{table}", hashrate(farm.rate(now)))
 }
 
 fn hashrate(rate: f64) -> String {
@@ -279,4 +396,36 @@ fn hashrate(rate: f64) -> String {
         r => (r / 1e9, "GH/s"),
     };
     format!("{rate:.2} {unit}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(name: &str) -> Arc<Shared> {
+        let shared = Arc::new(Shared::new());
+        shared.meter(name.into(), String::new(), None, None);
+        shared
+    }
+
+    #[test]
+    fn device_connections_get_independent_workers_and_tasks() {
+        let cpu = group("cpu");
+        let gpu = group("gpu0");
+        let farm = Farm::new(vec![cpu.clone(), gpu.clone()]);
+        let endpoint = "stratum+ssl://pool.example:1234".parse().unwrap();
+        let upstream = Upstream::new(vec![endpoint], Some("wallet.rig".into()), "x".into()).unwrap();
+
+        let links = connections(&upstream, &farm, true);
+        assert_eq!(links.len(), 2);
+        assert_eq!(cpu.meters()[0].worker().as_deref(), Some("rig-cpu"));
+        assert_eq!(gpu.meters()[0].worker().as_deref(), Some("rig-gpu0"));
+
+        cpu.set_task([1; 32], 11.into(), 101);
+        gpu.set_task([2; 32], 29.into(), 202);
+        assert_eq!(cpu.difficulty(), Some(11.into()));
+        assert_eq!(gpu.difficulty(), Some(29.into()));
+        assert_eq!(cpu.next_job(1).unwrap().nonce_start[3], 101);
+        assert_eq!(gpu.next_job(1).unwrap().nonce_start[3], 202);
+    }
 }

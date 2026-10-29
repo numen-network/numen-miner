@@ -55,6 +55,12 @@ impl fmt::Display for Endpoint {
     }
 }
 
+impl Endpoint {
+    pub fn is_stratum(&self) -> bool {
+        matches!(self, Endpoint::Stratum(_))
+    }
+}
+
 /// A live connection to one endpoint.
 enum Link {
     Node(rpc::Node),
@@ -73,9 +79,11 @@ impl Link {
     }
 }
 
+#[derive(Clone)]
 pub struct Upstream {
     endpoints: Vec<Endpoint>,
     login: Login,
+    label: String,
 }
 
 impl Upstream {
@@ -83,7 +91,24 @@ impl Upstream {
         let stratum = endpoints.iter().any(|endpoint| matches!(endpoint, Endpoint::Stratum(_)));
         ensure!(user.is_some() || !stratum, "stratum pools need --user WALLET.WORKER");
         let login = Login { user: user.unwrap_or_default(), pass };
-        Ok(Upstream { endpoints, login })
+        Ok(Upstream { endpoints, login, label: "rig".into() })
+    }
+
+    pub fn for_device(&self, device: &str) -> Self {
+        let mut upstream = self.clone();
+        if upstream.endpoints.iter().any(Endpoint::is_stratum) {
+            upstream.login = upstream.login.for_device(device);
+        }
+        upstream.label = device.into();
+        upstream
+    }
+
+    pub fn worker(&self) -> Option<String> {
+        if self.endpoints.iter().any(Endpoint::is_stratum) {
+            self.login.worker()
+        } else {
+            None
+        }
     }
 
     /// Mine through the first endpoint that answers. A link that drops is
@@ -104,7 +129,7 @@ impl Upstream {
                     }
                 },
             };
-            log::info!("connected to {endpoint}");
+            log::info!("{} connected to {endpoint}", self.label);
             let error = tokio::select! {
                 error = link.run(shared) => Some(error),
                 first = self.failback(), if index > 0 => {
@@ -115,7 +140,7 @@ impl Upstream {
             };
             shared.detach();
             if let Some(error) = error {
-                log::warn!("{endpoint}: {error:#}");
+                log::warn!("{} {endpoint}: {error:#}", self.label);
                 tokio::time::sleep(BACKOFF).await;
             }
         }
@@ -126,7 +151,7 @@ impl Upstream {
         for _ in 0..=RETRIES {
             match self.open(endpoint).await {
                 Ok(link) => return Some(link),
-                Err(e) => log::warn!("connect to {endpoint}: {e:#}"),
+                Err(e) => log::warn!("{} connect to {endpoint}: {e:#}", self.label),
             }
             tokio::time::sleep(BACKOFF).await;
         }

@@ -58,9 +58,29 @@ impl fmt::Display for Pool {
 }
 
 /// The worker a pool credits, as `WALLET.WORKER`, and its password.
+#[derive(Clone)]
 pub struct Login {
     pub user: String,
     pub pass: String,
+}
+
+impl Login {
+    pub fn for_device(&self, device: &str) -> Login {
+        let user = match self.user.split_once('.') {
+            Some((wallet, worker)) if !worker.is_empty() => format!("{wallet}.{worker}-{device}"),
+            Some((wallet, _)) => format!("{wallet}.{device}"),
+            None => format!("{}.{device}", self.user),
+        };
+        Login { user, pass: self.pass.clone() }
+    }
+
+    pub fn worker(&self) -> Option<String> {
+        self.user
+            .split_once('.')
+            .map(|(_, worker)| worker)
+            .filter(|worker| !worker.is_empty())
+            .map(str::to_string)
+    }
 }
 
 /// A pool connection, plain or TLS.
@@ -318,4 +338,69 @@ async fn read(reader: &mut Reader) -> Result<Message> {
     let line = reader.next_line().await?.context("pool closed the connection")?;
     ensure!(line.len() <= MAX_LINE, "pool line exceeds {MAX_LINE} bytes");
     serde_json::from_str(&line).with_context(|| format!("pool sent {line}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Login, Pool, Session};
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    fn login(user: &str) -> Login {
+        Login { user: user.into(), pass: "x".into() }
+    }
+
+    #[test]
+    fn device_login_preserves_the_rig_and_adds_the_device() {
+        let login = login("wallet.rig.site").for_device("gpu2");
+        assert_eq!(login.user, "wallet.rig.site-gpu2");
+        assert_eq!(login.worker().as_deref(), Some("rig.site-gpu2"));
+    }
+
+    #[test]
+    fn device_login_adds_a_worker_when_none_was_given() {
+        let login = login("wallet").for_device("cpu");
+        assert_eq!(login.user, "wallet.cpu");
+        assert_eq!(login.worker().as_deref(), Some("cpu"));
+    }
+
+    #[tokio::test]
+    async fn separate_sessions_authorize_their_derived_workers() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut users = Vec::new();
+            for connection in 0..2u64 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut lines = BufReader::new(reader).lines();
+
+                let subscribe: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                assert_eq!(subscribe["method"], "mining.subscribe");
+                let extranonce = format!("{:016x}", connection + 1);
+                let reply = json!({"id": 0, "result": [null, extranonce, 4], "error": null});
+                writer.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+
+                let authorize: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                assert_eq!(authorize["method"], "mining.authorize");
+                users.push(authorize["params"][0].as_str().unwrap().to_string());
+                let reply = json!({"id": 1, "result": true, "error": null});
+                writer.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+            }
+            users
+        });
+
+        let pool = Pool::new(&address.to_string(), false).unwrap();
+        let base = login("wallet.rig");
+        let cpu = base.for_device("cpu");
+        let gpu = base.for_device("gpu0");
+        let (cpu_session, gpu_session) = tokio::join!(Session::open(&pool, &cpu), Session::open(&pool, &gpu));
+        assert!(cpu_session.is_ok());
+        assert!(gpu_session.is_ok());
+
+        let mut users = server.await.unwrap();
+        users.sort();
+        assert_eq!(users, ["wallet.rig-cpu", "wallet.rig-gpu0"]);
+    }
 }
