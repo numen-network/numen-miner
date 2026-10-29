@@ -250,6 +250,8 @@ Effective hash rate is hash rate times retention, the share of nonces where the 
 
 The optimized GPU kernel keeps the same arithmetic while storing compact scalar vertex displacements and sharing exact coordinate reconstruction across fixed 16-face icosphere families. On the reference RX 7900 XT this increased measured end-to-end throughput by 6.375% with byte-identical GPU feature dumps. AMD mining also pipelines dispatch and pinned readback on one ordered HIP stream; scan kernels never overlap.
 
+The gfx1100 kernel also evaluates one statistically ranked adjacent quantization bucket when a feature lies close to a measured boundary. GPU candidates are deduplicated and recomputed canonically before submission. Three RX 7900 XT samples improved canonical coverage from 94.1–94.6% to 99.35–99.49%. This calibrated profile is enabled only for gfx1100; every other AMD architecture and NVIDIA keep the single-bucket kernel.
+
 ## Building from source
 
 ```bash
