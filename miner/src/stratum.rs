@@ -27,6 +27,12 @@ const JOBS: usize = 8;
 /// seconds, while a link that died without a word never errors.
 const QUIET: Duration = Duration::from_secs(120);
 
+/// Defensive bounds for a pool connection. A peer that keeps sending jobs but
+/// never answers shares must not grow the pending map forever.
+const MAX_PENDING: usize = 4096;
+const PENDING_TTL: Duration = Duration::from_secs(120);
+const MAX_LINE: usize = 64 * 1024;
+
 /// Where a stratum pool listens.
 #[derive(Clone)]
 pub struct Pool {
@@ -279,6 +285,12 @@ impl Book {
     /// Book a share as pending before it goes out, so its verdict always
     /// finds it. None when its job is closed.
     fn file(&mut self, share: Share, user: &str, extranonce: u64) -> Option<(u64, Value)> {
+        let now = Instant::now();
+        self.pending.retain(|_, (_, sent)| now.duration_since(*sent) < PENDING_TTL);
+        if self.pending.len() >= MAX_PENDING {
+            log::warn!("stratum pending-share limit reached; dropping a share until the pool answers");
+            return None;
+        }
         let job = self.jobs.iter().find(|(pre_hash, _)| *pre_hash == share.pre_hash);
         let Some((_, job)) = job.filter(|_| share.nonce[3] == extranonce) else {
             log::debug!("{} share for a closed job dropped", share.meter.name);
@@ -288,7 +300,7 @@ impl Book {
         let nonce = format!("{d:016x}{c:016x}{b:016x}{a:016x}");
         let params = json!([user, job, nonce, hex::encode(share.work)]);
         let id = self.take_id();
-        self.pending.insert(id, (share.meter, Instant::now()));
+        self.pending.insert(id, (share.meter, now));
         Some((id, params))
     }
 }
@@ -304,5 +316,6 @@ async fn send(writer: &mut Writer, id: u64, method: &str, params: Value) -> Resu
 
 async fn read(reader: &mut Reader) -> Result<Message> {
     let line = reader.next_line().await?.context("pool closed the connection")?;
+    ensure!(line.len() <= MAX_LINE, "pool line exceeds {MAX_LINE} bytes");
     serde_json::from_str(&line).with_context(|| format!("pool sent {line}"))
 }
