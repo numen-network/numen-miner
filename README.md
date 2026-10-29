@@ -248,6 +248,8 @@ Consumer GPUs run f64 at 1/16 to 1/64 of their f32 rate, so the kernels compute 
 
 Effective hash rate is hash rate times retention, the share of nonces where the kernel agrees with the chain. Retention is a price, not a gate. A variant that trades some for more speed wins when the product grows.
 
+The optimized GPU kernel keeps the same arithmetic while storing compact scalar vertex displacements and sharing exact coordinate reconstruction across fixed 16-face icosphere families. On the reference RX 7900 XT this increased measured end-to-end throughput by 6.375% with byte-identical GPU feature dumps. AMD mining also pipelines dispatch and pinned readback on one ordered HIP stream; scan kernels never overlap.
+
 ## Building from source
 
 ```bash
