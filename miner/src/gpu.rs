@@ -30,9 +30,9 @@ const MODERN_PTX: &str = include_str!("../ptx/modern.ptx");
 const LEGACY_PTX: &str = include_str!("../ptx/legacy.ptx");
 
 #[cfg(windows)]
-const LIBRARIES: &[&str] = &["amdhip64_6.dll", "amdhip64_7.dll"];
+const LIBRARIES: &[&str] = &["amdhip64_8.dll", "amdhip64_7.dll", "amdhip64_6.dll"];
 #[cfg(not(windows))]
-const LIBRARIES: &[&str] = &["libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so.5"];
+const LIBRARIES: &[&str] = &["libamdhip64.so.8", "libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so.5"];
 
 const MULTIPROCESSOR_COUNT: c_int = 63;
 const PCI_BUS_ID: c_int = 67;
