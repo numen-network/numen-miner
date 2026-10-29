@@ -85,7 +85,7 @@ Kepler and Maxwell cards can't be preempted in the middle of a launch. On Window
 | Command               | Effect                                                                                                               |
 | --------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `numen-miner`         | Mine through a node or a pool                                                                                        |
-| `numen-miner bench`   | Run the chosen devices on a fixed task and print their speed every minute until Ctrl+C. No node needed               |
+| `numen-miner bench`   | Measure the chosen devices on a fixed task for a repeatable duration. No node needed                                 |
 | `numen-miner devices` | List every GPU with the number `--devices` takes, then exit                                                          |
 | `numen-miner dump`    | Write one device's raw features for a run of nonces, for `numen-harness retention --from` to grade against the chain |
 
@@ -105,7 +105,8 @@ Kepler and Maxwell cards can't be preempted in the middle of a launch. On Window
 | `--cpu-affinity <LIST>`      | off                     | Logical CPUs to pin one CPU thread each to, as in `0-7,16`, in place of `--threads`                                                                                                |
 | `--no-gpu`                   | off                     | Skip the GPUs without opening any                                                                                                                                                  |
 | `-d, --devices <LIST>`       | every GPU               | GPUs to mine on, by the numbers `numen-miner devices` prints                                                                                                                       |
-| `-b, --batch <LIST>`         | 480 per SM or CU        | Nonces per launch for each mining GPU                                                                                                                                              |
+| `-b, --batch <LIST>`         | cached autotune         | Override the automatically selected nonces per launch for each mining GPU                                                                                                          |
+| `--retune`                   | off                     | Ignore saved automatic batches and measure the selected GPUs again                                                                                                                 |
 | `--temp-stop <C>`            | off                     | Pause a GPU that stays at or above this temperature for ten seconds                                                                                                                |
 | `--temp-start <C>`           | ten under `--temp-stop` | Resume a paused GPU at or below this temperature                                                                                                                                   |
 | `-i, --report-interval <S>`  | 60                      | Seconds between speed tables                                                                                                                                                       |
@@ -117,7 +118,11 @@ Several URLs in `--url` fail over in order. The miner mines through the first on
 
 `--no-gpu` mines without the GPUs and never opens one, which leaves them free for another miner.
 
-`--batch` sets how many nonces each mining GPU takes per launch, one value per GPU in the order `devices` lists them. `--devices 0,2 --batch 8192,4096` gives GPU 0 8192 nonces and GPU 2 4096. GPUs past the end of the list take its last value, so `--batch 4096` alone sets every GPU. By default a GPU takes 480 nonces per SM or CU per launch, and a 70-SM card then holds about 160 MiB of state. Lower `--batch` on a card short of memory.
+`--batch` sets how many nonces each mining GPU takes per launch, one value per GPU in the order `devices` lists them. `--devices 0,2 --batch 8192,4096` gives GPU 0 8192 nonces and GPU 2 4096. GPUs past the end of the list take its last value, so `--batch 4096` alone sets every GPU.
+
+When `--batch` is omitted, a GPU without a valid saved result gets a ten-second warm-up, three five-second measurements of four architecture-scaled sizes in changing order, then confirmation measurements of the best two. A candidate within three percent of the fastest is treated as equivalent and the size closest to the architecture baseline wins, which avoids chasing clock noise. The cache is invalidated when the GPU identity, driver or HIP runtime, embedded kernel or tuner revision changes. Use `--retune` after changing clocks, power limits or cooling. An explicit `--batch` skips both the cache and tuning entirely. The tuning allocation is capped at one quarter of VRAM.
+
+The cache is `autotune.json` beside the running `numen-miner` executable on every platform. Each copied installation therefore keeps its own tuning result. Move that file with the miner to reuse its tuning, delete it to start fresh, or use `--retune` to replace its saved result explicitly.
 
 `--temp-stop 85` pauses a GPU that has stayed at 85 C or hotter for ten seconds and resumes it at 75 C, or at `--temp-start` if you set one. Readings come from NVML on NVIDIA cards, and on AMD cards from the amdgpu driver's sysfs on Linux and ADLX on Windows. A card without readings never pauses.
 
@@ -126,7 +131,7 @@ Every option also comes from an environment variable, `NUMEN_MINER_` plus the lo
 ### numen-miner bench
 
 ```bash
-./numen-miner bench --devices 0 --batch 8192
+./numen-miner bench --devices 0 --duration 60 --json benchmark.json
 ```
 
 | Option                  | Default          | Effect                                                                              |
@@ -136,9 +141,13 @@ Every option also comes from an environment variable, `NUMEN_MINER_` plus the lo
 | `--cpu-affinity <LIST>` | off              | Logical CPUs to pin one CPU thread each to, as in `0-7,16`, in place of `--threads` |
 | `--no-gpu`              | off              | Skip the GPUs without opening any                                                   |
 | `-d, --devices <LIST>`  | every GPU        | GPUs to mine on, by the numbers `numen-miner devices` prints                        |
-| `-b, --batch <LIST>`    | 480 per SM or CU | Nonces per launch for each mining GPU                                               |
+| `-b, --batch <LIST>`    | cached autotune  | Override the automatically selected nonces per launch for each mining GPU           |
+| `--retune`              | off              | Ignore saved automatic batches and measure again                                    |
+| `--duration <S>`        | 60               | Measured seconds after setup and autotuning; zero runs until Ctrl+C                  |
+| `-i, --report-interval` | 10               | Seconds between progress tables                                                     |
+| `--json <FILE>`         | none             | Write the final duration, rate, work count and per-device measurements as JSON       |
 
-`bench` needs no node and prints the speed table every minute until Ctrl+C, which makes it the place to tune `--batch`. Its options come from the same environment variables as mining.
+`bench` needs no node. Setup and autotuning happen before its duration starts. Without `--batch` it uses the same persistent autotune result as normal mining; pass an explicit value to compare a fixed size or `--retune` to refresh the saved choice. Its device options come from the same environment variables as mining.
 
 ### numen-miner devices
 
@@ -185,6 +194,7 @@ curl -s http://127.0.0.1:4068/summary
     {
       "name": "gpu0",
       "bus": "2b:00.0",
+      "batch": 40320,
       "hashrate": 15298.0,
       "accepted": 12,
       "rejected": 1,
@@ -197,7 +207,7 @@ curl -s http://127.0.0.1:4068/summary
 }
 ```
 
-`hashrate` is hashes per second over the last minute, or since startup in the first minute. `temp` is in degrees Celsius and `power` in watts. `fan` is `{"percent": n}` from NVML and `{"rpm": n}` on AMD. A reading the driver doesn't report is `null`. The CPU shows up as `cpu` with an empty `bus`.
+`hashrate` is hashes per second over the last minute, or since startup in the first minute. `batch` is the selected GPU launch size and is `null` for the CPU. `temp` is in degrees Celsius and `power` in watts. `fan` is `{"percent": n}` from NVML and `{"rpm": n}` on AMD. A reading the driver doesn't report is `null`. The CPU shows up as `cpu` with an empty `bus`.
 
 ## HiveOS
 
@@ -266,6 +276,7 @@ The script builds one code object per architecture into `miner/gfx`. Name archit
 | `numen-harness retention`  | Compare the kernel against the canonical pipeline nonce by nonce    |
 | `numen-harness throughput` | Measure throughput on both sides                                    |
 | `numen-harness power`      | Retention and throughput together, reported as effective hash power |
+| `numen-harness gpu-power`  | Combine a GPU feature dump with a miner benchmark JSON               |
 
 ### numen-harness retention
 
@@ -312,6 +323,23 @@ The script builds one code object per architecture into `miner/gfx`. Name archit
 | `--threads <N>`    | 1       | Threads to time each side on                               |
 
 `power` is the number that decides. It reports throughput and retention separately and then multiplies them. Its retention half runs on every core whatever `--threads` says.
+
+### Reproducible GPU power benchmark
+
+Build the workspace in release mode, make sure no miner is running, then on Windows run:
+
+```powershell
+cargo build --release --workspace
+powershell -ExecutionPolicy Bypass -File scripts/benchmark-effective.ps1 -Device 0 -Duration 60 -RetentionCount 512
+```
+
+The script refuses to start while another `numen-miner` process exists and runs its benchmark and feature dump sequentially. It creates a timestamped directory under `benchmark-results` containing the raw benchmark JSON, the GPU feature dump and `effective.txt`. Effective hash power is the measured raw GPU rate multiplied by the dump's chain retention.
+
+The same final calculation can be run directly on every platform:
+
+```bash
+./target/release/numen-harness gpu-power --from gpu0.txt --benchmark benchmark.json --device gpu0 --attribute
+```
 
 ## Layout
 
